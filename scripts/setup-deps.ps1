@@ -88,5 +88,5 @@ if (-not $NoModel -and -not (Test-Path $model)) {
 
 Write-Host ""
 Write-Host "완료. 이제 빌드하세요:" -ForegroundColor Green
-Write-Host '  cmake -S . -B build -G "Visual Studio 17 2022" -A x64'
+Write-Host '  cmake -S . -B build -A x64'
 Write-Host '  cmake --build build --config Release'

@@ -16,7 +16,9 @@ Write-Host "==> YouShadow v$version" -ForegroundColor Cyan
 
 if (-not $SkipBuild) {
     Write-Host "==> 빌드" -ForegroundColor Cyan
-    cmake -S . -B build -G "Visual Studio 17 2022" -A x64 | Out-Null
+    # 생성기를 지정하지 않으면 설치된 최신 Visual Studio 를 쓴다 (2022 / 2026 모두 동작)
+    cmake -S . -B build -A x64
+    if ($LASTEXITCODE -ne 0) { throw "cmake configure failed" }
     cmake --build build --config Release --target youshadow-gui
     if ($LASTEXITCODE -ne 0) { throw "build failed" }
 }

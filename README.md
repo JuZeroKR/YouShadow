@@ -48,14 +48,14 @@
 
 ## 빌드 (개발자용)
 
-요구 사항: Windows 10/11, Visual Studio 2022 (MSVC), CMake 3.20+, git
+요구 사항: Windows 10/11, Visual Studio 2022 이상 (MSVC), CMake 3.20+, git
 
 ```powershell
 # 1. 의존성 받기 (third_party/ 와 models/ 에 설치, 저장소에는 포함되지 않음)
 powershell -ExecutionPolicy Bypass -File scripts\setup-deps.ps1
 
-# 2. 빌드
-cmake -S . -B build -G "Visual Studio 17 2022" -A x64
+# 2. 빌드 (설치된 최신 Visual Studio 를 자동으로 사용)
+cmake -S . -B build -A x64
 cmake --build build --config Release
 
 # 3. 실행에 필요한 외부 도구
