@@ -1,0 +1,14 @@
+# 빌드 결과물
+build/
+out/
+.vs/
+.claude/
+
+# 학습 데이터 (영상, 자막, 녹음, SQLite) — 절대 올리지 않는다
+data/
+
+# whisper 모델 (148MB)
+models/
+
+# 외부 라이브러리 — scripts/setup-deps.ps1 로 받는다
+third_party/
