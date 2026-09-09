@@ -9,6 +9,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cctype>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -29,6 +30,7 @@
 #include "paths.h"
 #include "player.h"
 #include "secret.h"
+#include "tts.h"
 #include "scoring.h"
 #include "stt.h"
 #include "transcript.h"
@@ -328,6 +330,32 @@ struct App {
     bool cardsDirty = true;
     bool cardRevealed = false;  // 복습 세션에서 표현 카드 뜻 보기
 
+    // ---- 음량 / 발음 ----
+    Tts tts;
+    int videoVolume = 100;   // 영상 음량 (0~100)
+    int recVolume = 100;     // 내 녹음 재생 음량 (0~200 %)
+    bool ttsSlow = false;    // 발음을 천천히
+
+    void applyAudioSettings() {
+        mpv.setVolume(videoVolume);
+        recPlayer.setGain(recVolume / 100.0f);
+        tts.setVolume(100);
+    }
+
+    void speak(const std::string& text) {
+        if (!tts.available()) { message = "이 PC 에 음성 합성 엔진이 없습니다"; return; }
+        tts.speak(text, ttsSlow ? -4 : 0);
+    }
+
+    // 단어 버튼용: 앞뒤 문장 부호 제거
+    static std::string bareWord(const std::string& w) {
+        size_t a = 0, b = w.size();
+        auto isP = [](unsigned char c) { return c < 128 && !std::isalnum(c) && c != '\''; };
+        while (a < b && isP((unsigned char)w[a])) ++a;
+        while (b > a && isP((unsigned char)w[b - 1])) --b;
+        return w.substr(a, b - a);
+    }
+
     // 복습 탭
     Tab forceTab = Tab::None;  // 한 프레임 동안 강제로 선택할 탭
     std::vector<ReviewItem> reviewItems;
@@ -443,6 +471,9 @@ struct App {
         llm.openaiModel = db.getSetting("llm.openai.model", llm.openaiModel);
         llm.geminiModel = db.getSetting("llm.gemini.model", llm.geminiModel);
         providerSel = (int)llm.provider;
+        videoVolume = std::clamp(std::stoi(db.getSetting("audio.videoVolume", "100")), 0, 100);
+        recVolume = std::clamp(std::stoi(db.getSetting("audio.recVolume", "100")), 0, 200);
+        ttsSlow = db.getSetting("tts.slow", "0") == "1";
         snprintf(keyBuf[0], sizeof keyBuf[0], "%s", llm.claudeKey.c_str());
         snprintf(keyBuf[1], sizeof keyBuf[1], "%s", llm.openaiKey.c_str());
         snprintf(keyBuf[2], sizeof keyBuf[2], "%s", llm.geminiKey.c_str());
@@ -1154,6 +1185,8 @@ struct App {
             bool saved = db.hasExpression(video.id, current, e.text);
             ImGui::TextColored(ImVec4(1.0f, 0.9f, 0.5f, 1.0f), "%s", e.text.c_str());
             ImGui::SameLine();
+            if (tts.available() && ImGui::SmallButton("듣기")) speak(e.text);
+            ImGui::SameLine();
             if (saved) ImGui::TextDisabled("저장됨");
             else if (ImGui::SmallButton("저장")) saveExpression(current, e);
             ImGui::TextWrapped("뜻: %s", e.meaning.c_str());
@@ -1182,6 +1215,8 @@ struct App {
             const auto& c = cards[k];
             ImGui::PushID((int)c.id);
             ImGui::TextColored(ImVec4(1.0f, 0.9f, 0.5f, 1.0f), "%s", c.text.c_str());
+            ImGui::SameLine();
+            if (tts.available() && ImGui::SmallButton("듣기")) speak(c.text);
             ImGui::SameLine();
             ImGui::TextDisabled("(%d회, 다음 %s)", c.reviews, c.dueAt.substr(0, 10).c_str());
             ImGui::SameLine();
@@ -1308,6 +1343,30 @@ struct App {
         }
         forceTab = Tab::None;  // SetSelected 는 한 프레임만
         ImGui::EndChild();
+    }
+
+    // 현재 문장을 단어 버튼으로 펼친다. 클릭하면 그 단어의 발음이 나온다.
+    void drawWordRow() {
+        if (!valid(current)) { ImGui::TextDisabled("발음: 문장을 선택하면 단어를 클릭해 발음을 들을 수 있습니다"); return; }
+        if (!tts.available()) { ImGui::TextDisabled("발음: 이 PC 에 음성 합성 엔진이 없어 단어 발음을 들려줄 수 없습니다"); return; }
+        ImGui::TextDisabled("발음:");
+        ImGui::SameLine();
+        if (ImGui::SmallButton("문장 듣기")) speak(seg(current).text);
+        ImGui::SameLine();
+        if (ImGui::Checkbox("천천히", &ttsSlow)) db.setSetting("tts.slow", ttsSlow ? "1" : "0");
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("음성: %s", tts.voiceName().c_str());
+        const float lineRight = ImGui::GetWindowPos().x + ImGui::GetWindowSize().x - ImGui::GetStyle().WindowPadding.x;
+        const float spacing = ImGui::GetStyle().ItemSpacing.x;
+        std::istringstream ss(seg(current).text);
+        std::string w;
+        int k = 0;
+        while (ss >> w) {
+            ImGui::PushID(k++);
+            float bw = ImGui::CalcTextSize(w.c_str()).x + ImGui::GetStyle().FramePadding.x * 2;
+            if (ImGui::GetItemRectMax().x + spacing + bw <= lineRight) ImGui::SameLine();
+            if (ImGui::SmallButton(w.c_str())) { std::string b = bareWord(w); if (!b.empty()) speak(b); }
+            ImGui::PopID();
+        }
     }
 
     void drawScoreLine() {
@@ -1480,6 +1539,8 @@ struct App {
                 const auto& it = session.queue[session.pos];
                 ImGui::TextColored(ImVec4(1.0f, 0.9f, 0.5f, 1.0f), "표현 카드:  %s", it.text.c_str());
                 ImGui::SameLine();
+                if (tts.available() && ImGui::SmallButton("듣기")) speak(it.text);
+                ImGui::SameLine();
                 if (!cardRevealed) { if (ImGui::SmallButton("뜻 보기")) cardRevealed = true; }
                 else {
                     ImGui::TextWrapped("뜻: %s   %s", it.meaning.c_str(), it.note.c_str());
@@ -1504,6 +1565,12 @@ struct App {
         ImGui::SameLine(0, 24);
         ImGui::SetNextItemWidth(140 * uiScale);
         if (ImGui::SliderFloat("속도", &speed, 0.5f, 1.5f, "%.2fx")) mpv.setSpeed(speed);
+        ImGui::SameLine(0, 24);
+        ImGui::SetNextItemWidth(120 * uiScale);
+        if (ImGui::SliderInt("영상 음량", &videoVolume, 0, 100, "%d%%")) { mpv.setVolume(videoVolume); db.setSetting("audio.videoVolume", std::to_string(videoVolume)); }
+        ImGui::SameLine(0, 12);
+        ImGui::SetNextItemWidth(120 * uiScale);
+        if (ImGui::SliderInt("내 녹음 음량", &recVolume, 0, 200, "%d%%")) { recPlayer.setGain(recVolume / 100.0f); db.setSetting("audio.recVolume", std::to_string(recVolume)); }
         ImGui::SameLine(0, 24);
         ImGui::Checkbox("문장 끝에서 정지", &stopAtEnd);
         ImGui::SameLine();
@@ -1554,7 +1621,10 @@ struct App {
             mpv.setPaused(false);
         }
 
-        // 4행: 채점 결과 + 난이도 평가
+        // 4행: 단어 발음 (클릭하면 읽어 준다)
+        drawWordRow();
+
+        // 5행: 채점 결과 + 난이도 평가
         ImGui::BeginDisabled(!can);
         drawScoreLine();
         ImGui::BeginDisabled(!valid(current));
@@ -1626,6 +1696,7 @@ struct App {
         else if (cmd == "explain" && valid(current)) requestExplain({current});
         else if (cmd == "explain_all") requestExplainAll();
         else if (cmd == "settings") showSettings = true;
+        else if (cmd == "say") { std::string rest; std::getline(ss, rest); speak(arg + rest); fprintf(stderr, "[tts] voice=%s available=%d\n", tts.voiceName().c_str(), (int)tts.available()); }
         else if (cmd == "tab") forceTab = arg == "explain" ? Tab::Explain : arg == "cards" ? Tab::Cards : arg == "review" ? Tab::Review : arg == "history" ? Tab::History : Tab::Sentences;
         else if (cmd == "rescore" && valid(current) && stt.loaded()) {
             // 현재 문장의 마지막 녹음을 다시 채점 (마이크 없이 채점 화면 확인용)
@@ -1700,7 +1771,7 @@ struct App {
             drawHome(avail);
         } else {
             const float rightW = std::clamp(avail.x * 0.34f, 280.0f * uiScale, 520.0f * uiScale);
-            const float bottomH = 300.0f * uiScale;
+            const float bottomH = 330.0f * uiScale;
             drawVideoPanel(ImVec2(avail.x - rightW - 8, avail.y - bottomH - 8));
             ImGui::SameLine();
             drawRightPanel(ImVec2(rightW, avail.y - bottomH - 8));
@@ -1806,6 +1877,8 @@ int main(int argc, char** argv) {
     }
     app.db.importTsv(paths::dataDir() + "\\practice.tsv");
     app.loadSettings();
+    app.tts.init();
+    app.applyAudioSettings();
     if (fs::exists(Stt::defaultModelPath())) app.sttLoader.start(&app.stt, false);
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];

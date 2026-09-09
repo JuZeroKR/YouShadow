@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(YouShadow VERSION 0.2.0 LANGUAGES C CXX)
+project(YouShadow VERSION 0.3.0 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -46,9 +46,10 @@ add_library(ys_core STATIC
     src/http.cpp
     src/secret.cpp
     src/llm.cpp
+    src/tts.cpp
 )
 target_include_directories(ys_core PUBLIC ${TP} src)
-target_link_libraries(ys_core PUBLIC ys_options sqlite3 whisper winhttp crypt32)
+target_link_libraries(ys_core PUBLIC ys_options sqlite3 whisper winhttp crypt32 ole32)
 
 # ---- Dear ImGui + GLFW 백엔드 ----
 set(IMGUI ${TP}/imgui)

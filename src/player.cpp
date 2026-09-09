@@ -120,6 +120,11 @@ void MpvPlayer::setSpeed(double speed) {
     mpv_set_property(mpv_, "speed", MPV_FORMAT_DOUBLE, &speed);
 }
 
+void MpvPlayer::setVolume(double percent) {
+    if (!mpv_) return;
+    mpv_set_property(mpv_, "volume", MPV_FORMAT_DOUBLE, &percent);
+}
+
 double MpvPlayer::getDouble(const char* prop) const {
     double v = 0.0;
     if (mpv_) mpv_get_property(mpv_, prop, MPV_FORMAT_DOUBLE, &v);

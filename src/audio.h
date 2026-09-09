@@ -64,6 +64,7 @@ public:
     void stop();
     bool playing() const;
     int positionMs() const;
+    void setGain(float gain);           // 1.0 = 원음, 2.0 = 두 배
 
 private:
     struct Impl;

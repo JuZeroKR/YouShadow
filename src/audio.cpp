@@ -310,6 +310,7 @@ struct Player::Impl {
     std::vector<float> pcm;
     std::atomic<size_t> cursor{0};
     std::atomic<bool> done{true};
+    std::atomic<float> gain{1.0f};
 
     static void cb(ma_device* d, void* out, const void*, ma_uint32 n) {
         auto* self = static_cast<Impl*>(d->pUserData);
@@ -317,7 +318,8 @@ struct Player::Impl {
         size_t c = self->cursor;
         size_t avail = c < self->pcm.size() ? self->pcm.size() - c : 0;
         size_t k = std::min<size_t>(avail, n);
-        std::copy(self->pcm.begin() + c, self->pcm.begin() + c + k, o);
+        const float g = self->gain.load();
+        for (size_t i = 0; i < k; ++i) o[i] = std::clamp(self->pcm[c + i] * g, -1.0f, 1.0f);
         std::fill(o + k, o + n, 0.0f);
         self->cursor = c + k;
         if (k < n) self->done = true;
@@ -346,4 +348,5 @@ void Player::stop() {
 }
 
 bool Player::playing() const { return impl_->open && !impl_->done; }
+void Player::setGain(float gain) { impl_->gain = std::max(0.0f, gain); }
 int Player::positionMs() const { return (int)(impl_->cursor * 1000 / kSR); }

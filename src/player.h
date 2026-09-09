@@ -24,6 +24,7 @@ public:
     bool paused() const;
     bool seeking() const;
     void setSpeed(double speed);
+    void setVolume(double percent);  // 0~100
     double timePos() const;
     double duration() const;
 
