@@ -25,8 +25,10 @@
 
 #include "audio.h"
 #include "db.h"
+#include "llm.h"
 #include "paths.h"
 #include "player.h"
+#include "secret.h"
 #include "scoring.h"
 #include "stt.h"
 #include "transcript.h"
@@ -190,7 +192,7 @@ struct ScoreJob {
 // ---------------- 앱 상태 ----------------
 
 enum class Mode { Idle, Segment, Shadow, ShadowTail, EchoListen, EchoRecord, EchoCompareOrig, EchoCompareMine, Record, MyRec };
-enum class Tab { None, Sentences, Review, Bookmarks };
+enum class Tab { None, Sentences, Review, Bookmarks, History, Explain, Cards };
 
 const char* modeLabel(Mode m) {
     switch (m) {
@@ -286,6 +288,46 @@ struct App {
     int historySeg = -1;
     bool historyDirty = true;
 
+    // ---- AI 해설 (Claude / ChatGPT / Gemini) ----
+    LlmConfig llm;
+    bool showSettings = false;
+    int providerSel = 0;
+    char keyBuf[3][256] = {};
+    char modelBuf[3][128] = {};
+    std::vector<std::string> modelList[3];
+    std::string settingsMsg;
+
+    // 모델 목록 / 연결 테스트 (백그라운드)
+    struct LlmSmallJob {
+        std::thread th;
+        std::mutex m;
+        bool running = false, done = false;
+        int kind = 0;  // 0: 모델 목록, 1: 연결 테스트
+        int provider = 0;
+        std::vector<std::string> models;
+        std::string text, err;
+        ~LlmSmallJob() { if (th.joinable()) th.join(); }
+    } llmJob;
+
+    // 문장 해설 작업 (한 문장 또는 여러 문장 순차)
+    struct ExplainJob {
+        std::thread th;
+        std::mutex m;
+        bool running = false;
+        std::string videoId;
+        std::vector<int> queue;
+        int done = 0;
+        std::vector<std::pair<int, Explanation>> ready;  // 완료된 결과 (메인 스레드가 가져감)
+        std::string err;
+        std::atomic<bool> cancel{false};
+        ~ExplainJob() { cancel = true; if (th.joinable()) th.join(); }
+    } explainJob;
+    std::map<int, Explanation> explanations;  // 현재 영상의 해설 캐시
+    std::set<int> explained;
+    std::vector<ExpressionCard> cards;
+    bool cardsDirty = true;
+    bool cardRevealed = false;  // 복습 세션에서 표현 카드 뜻 보기
+
     // 복습 탭
     Tab forceTab = Tab::None;  // 한 프레임 동안 강제로 선택할 탭
     std::vector<ReviewItem> reviewItems;
@@ -340,7 +382,8 @@ struct App {
     void startSession() {
         session = ReviewSession();
         session.queue = db.due();
-        if (session.queue.empty()) { infoPopup = "지금 복습할 문장이 없습니다.\n연습한 문장은 다음 날 복습 목록에 나타납니다."; return; }
+        for (auto& e : db.dueExpressions()) session.queue.push_back(e);
+        if (session.queue.empty()) { infoPopup = "지금 복습할 문장이 없습니다.\n연습한 문장과 저장한 표현은 다음 날 복습 목록에 나타납니다."; return; }
         session.active = true;
         openSessionItem();
     }
@@ -348,6 +391,7 @@ struct App {
     void openSessionItem() {
         if (session.pos >= session.queue.size()) { endSession(); return; }
         showHome = false;
+        cardRevealed = false;
         openReviewItem(session.queue[session.pos]);
     }
 
@@ -387,6 +431,126 @@ struct App {
         stopAll();
         showHome = true;
         libraryDirty = true;
+    }
+
+    // ---- AI 설정 ----
+    void loadSettings() {
+        llm.provider = (Provider)std::clamp(std::stoi(db.getSetting("llm.provider", "0")), 0, 2);
+        llm.claudeKey = secret::unprotect(db.getSetting("llm.claude.key"));
+        llm.openaiKey = secret::unprotect(db.getSetting("llm.openai.key"));
+        llm.geminiKey = secret::unprotect(db.getSetting("llm.gemini.key"));
+        llm.claudeModel = db.getSetting("llm.claude.model", llm.claudeModel);
+        llm.openaiModel = db.getSetting("llm.openai.model", llm.openaiModel);
+        llm.geminiModel = db.getSetting("llm.gemini.model", llm.geminiModel);
+        providerSel = (int)llm.provider;
+        snprintf(keyBuf[0], sizeof keyBuf[0], "%s", llm.claudeKey.c_str());
+        snprintf(keyBuf[1], sizeof keyBuf[1], "%s", llm.openaiKey.c_str());
+        snprintf(keyBuf[2], sizeof keyBuf[2], "%s", llm.geminiKey.c_str());
+        snprintf(modelBuf[0], sizeof modelBuf[0], "%s", llm.claudeModel.c_str());
+        snprintf(modelBuf[1], sizeof modelBuf[1], "%s", llm.openaiModel.c_str());
+        snprintf(modelBuf[2], sizeof modelBuf[2], "%s", llm.geminiModel.c_str());
+    }
+
+    // 설정 창의 입력값을 llm 에 반영하고 DB 에 저장 (키는 DPAPI 로 암호화)
+    void applySettings() {
+        llm.provider = (Provider)providerSel;
+        llm.claudeKey = keyBuf[0]; llm.openaiKey = keyBuf[1]; llm.geminiKey = keyBuf[2];
+        llm.claudeModel = modelBuf[0]; llm.openaiModel = modelBuf[1]; llm.geminiModel = modelBuf[2];
+        db.setSetting("llm.provider", std::to_string(providerSel));
+        db.setSetting("llm.claude.key", secret::protect(llm.claudeKey));
+        db.setSetting("llm.openai.key", secret::protect(llm.openaiKey));
+        db.setSetting("llm.gemini.key", secret::protect(llm.geminiKey));
+        db.setSetting("llm.claude.model", llm.claudeModel);
+        db.setSetting("llm.openai.model", llm.openaiModel);
+        db.setSetting("llm.gemini.model", llm.geminiModel);
+    }
+
+    LlmConfig configFromBuffers() const {
+        LlmConfig c = llm;
+        c.provider = (Provider)providerSel;
+        c.claudeKey = keyBuf[0]; c.openaiKey = keyBuf[1]; c.geminiKey = keyBuf[2];
+        c.claudeModel = modelBuf[0]; c.openaiModel = modelBuf[1]; c.geminiModel = modelBuf[2];
+        return c;
+    }
+
+    void startModelList(int provider) {
+        if (llmJob.running) return;
+        if (llmJob.th.joinable()) llmJob.th.join();
+        llmJob.running = true; llmJob.done = false; llmJob.kind = 0; llmJob.provider = provider; llmJob.err.clear();
+        LlmConfig cfg = configFromBuffers();
+        llmJob.th = std::thread([this, cfg, provider] {
+            std::string e;
+            auto list = llmListModels(cfg, (Provider)provider, &e);
+            std::lock_guard<std::mutex> lock(llmJob.m);
+            llmJob.models = list; llmJob.err = e; llmJob.done = true;
+        });
+    }
+
+    void startConnectionTest() {
+        if (llmJob.running) return;
+        if (llmJob.th.joinable()) llmJob.th.join();
+        llmJob.running = true; llmJob.done = false; llmJob.kind = 1; llmJob.err.clear();
+        LlmConfig cfg = configFromBuffers();
+        llmJob.th = std::thread([this, cfg] {
+            std::string e;
+            std::string t = llmComplete(cfg, "Reply with exactly: OK", "ping", &e);
+            std::lock_guard<std::mutex> lock(llmJob.m);
+            llmJob.text = t; llmJob.err = e; llmJob.done = true;
+        });
+    }
+
+    // ---- 문장 해설 ----
+    void loadExplanations() {
+        explanations.clear();
+        explained = db.explainedSegments(video.id);
+        for (int i : explained) explanations[i] = Explanation::fromJson(db.getExplanation(video.id, i));
+    }
+
+    void requestExplain(std::vector<int> idxs) {
+        if (!loaded || idxs.empty()) return;
+        if (!llm.ready()) { message = "AI 설정에서 API 키와 모델을 먼저 입력하세요"; showSettings = true; return; }
+        if (explainJob.running) { message = "이미 해설을 만드는 중입니다"; return; }
+        if (explainJob.th.joinable()) explainJob.th.join();
+        explainJob.running = true;
+        explainJob.cancel = false;
+        explainJob.videoId = video.id;
+        explainJob.queue = std::move(idxs);
+        explainJob.done = 0;
+        explainJob.err.clear();
+        explainJob.ready.clear();
+        LlmConfig cfg = llm;
+        std::vector<Segment> segs = video.segs;
+        std::vector<int> queue = explainJob.queue;
+        explainJob.th = std::thread([this, cfg, segs, queue] {
+            for (int i : queue) {
+                if (explainJob.cancel) break;
+                std::string before = i > 0 ? segs[i - 1].text : "";
+                std::string after = i + 1 < (int)segs.size() ? segs[i + 1].text : "";
+                std::string e;
+                Explanation ex = explainSentence(cfg, segs[i].text, before, after, &e);
+                std::lock_guard<std::mutex> lock(explainJob.m);
+                explainJob.done++;
+                if (e.empty()) explainJob.ready.push_back({i, ex});
+                else { explainJob.err = e; if (queue.size() == 1) break; }
+            }
+            std::lock_guard<std::mutex> lock(explainJob.m);
+            explainJob.running = false;
+        });
+    }
+
+    void requestExplainAll() {
+        std::vector<int> idxs;
+        for (int i = 0; i < (int)video.segs.size(); ++i) if (!explained.count(i)) idxs.push_back(i);
+        if (idxs.empty()) { message = "모든 문장에 해설이 있습니다"; return; }
+        requestExplain(idxs);
+    }
+
+    void saveExpression(int segIdx, const Expression& e) {
+        if (db.hasExpression(video.id, segIdx, e.text)) return;
+        db.addExpression(video.id, segIdx, e.text, e.meaning, e.note, e.example);
+        cardsDirty = true;
+        libraryDirty = true;
+        message = "표현 노트에 저장: " + e.text;
     }
 
     long long log(int i, const char* modeName, const std::string& rec = "") {
@@ -539,7 +703,13 @@ struct App {
 
     void rateCurrent(Db::Grade g) {
         if (!valid(current)) return;
-        db.rate(video.id, current, g);
+        // 복습 세션의 현재 항목이 표현 카드면 표현에, 아니면 문장에 평가를 적용한다
+        if (sessionItemIsCurrent() && session.queue[session.pos].expressionId > 0) {
+            db.rateExpression(session.queue[session.pos].expressionId, g);
+            cardsDirty = true;
+        } else {
+            db.rate(video.id, current, g);
+        }
         refreshStats();
         message = g == Db::Hard ? "반나절 뒤 다시 복습" : g == Db::Good ? "복습 간격 늘림" : "쉬움: 복습 간격 크게 늘림";
         // 복습 세션 중이면 집계하고 다음 문장으로
@@ -668,6 +838,32 @@ struct App {
             std::lock_guard<std::mutex> lock(sttLoader.m);
             if (!sttLoader.busy && !sttLoader.status.empty()) { message = sttLoader.status; sttLoader.status.clear(); }
         }
+        // AI 모델 목록 / 연결 테스트
+        {
+            std::lock_guard<std::mutex> lock(llmJob.m);
+            if (llmJob.done) {
+                llmJob.done = false;
+                llmJob.running = false;
+                if (llmJob.kind == 0) {
+                    if (llmJob.err.empty()) { modelList[llmJob.provider] = llmJob.models; settingsMsg = std::to_string(llmJob.models.size()) + "개 모델을 찾았습니다. 목록에서 고르세요"; }
+                    else settingsMsg = "모델 목록 실패: " + llmJob.err;
+                } else {
+                    settingsMsg = llmJob.err.empty() ? "연결 성공: " + llmJob.text.substr(0, 40) : "연결 실패: " + llmJob.err;
+                }
+            }
+        }
+        // 문장 해설 결과 수거
+        {
+            std::lock_guard<std::mutex> lock(explainJob.m);
+            if (!explainJob.ready.empty()) {
+                for (auto& [i, ex] : explainJob.ready) {
+                    db.setExplanation(explainJob.videoId, i, ex.toJson());
+                    if (loaded && video.id == explainJob.videoId) { explanations[i] = ex; explained.insert(i); }
+                }
+                explainJob.ready.clear();
+            }
+            if (!explainJob.running && !explainJob.err.empty()) { message = "해설 실패: " + explainJob.err; explainJob.err.clear(); }
+        }
         // 채점
         {
             std::lock_guard<std::mutex> lock(scoreJob.m);
@@ -705,6 +901,7 @@ struct App {
         forceTab = Tab::Sentences;
         showHome = false;
         historySeg = -1;
+        loadExplanations();
         if (pendingSeg >= 0) {
             // 영상이 mpv 에 실제로 열린 뒤 재생해야 하므로 프레임 뒤로 미룬다
             current = std::min(pendingSeg, (int)video.segs.size() - 1);
@@ -816,6 +1013,7 @@ struct App {
             if (c > 0) extra += "  (" + std::to_string(c) + "회";
             if (bestScores.count(i)) extra += (c > 0 ? " · " : "  (") + std::to_string((int)bestScores[i]) + "%";
             if (!extra.empty()) extra += ")";
+            if (explained.count(i)) extra += "  해설";
             snprintf(label, sizeof label, "%s[%d] %s%s", bookmarks.count(i) ? "★ " : "", i, transcript::formatTime(s.startMs).c_str(), extra.c_str());
 
             const float wrap = ImGui::GetContentRegionAvail().x - 8;
@@ -913,6 +1111,150 @@ struct App {
         }
     }
 
+    // AI 해설 탭: 현재 문장의 번역, 표현, 문법
+    void drawExplainTab() {
+        bool running;
+        int done, total;
+        { std::lock_guard<std::mutex> lock(explainJob.m); running = explainJob.running; done = explainJob.done; total = (int)explainJob.queue.size(); }
+
+        if (!llm.ready()) {
+            ImGui::TextWrapped("AI 해설을 쓰려면 API 키가 필요합니다. 상단 [AI 설정]에서 Claude / ChatGPT / Gemini 중 하나를 골라 키를 넣으세요.");
+            if (ImGui::Button("AI 설정 열기")) showSettings = true;
+            return;
+        }
+        ImGui::TextDisabled("%s · %s   해설 %d / %d 문장", providerName(llm.provider), llm.model(llm.provider).c_str(), (int)explained.size(), (int)video.segs.size());
+        if (running) {
+            ImGui::TextColored(ImVec4(1, 0.8f, 0.3f, 1), "해설 생성 중 %d / %d", done, total);
+            ImGui::SameLine();
+            if (ImGui::SmallButton("중단")) explainJob.cancel = true;
+        } else {
+            if (ImGui::Button("이 문장 해설")) { if (valid(current)) requestExplain({current}); }
+            ImGui::SameLine();
+            if (ImGui::Button("모든 문장 해설")) requestExplainAll();
+            ImGui::SameLine();
+            ImGui::TextDisabled("(%d개 남음)", (int)video.segs.size() - (int)explained.size());
+        }
+        ImGui::Separator();
+        if (!valid(current)) { ImGui::TextDisabled("문장을 선택하세요."); return; }
+        ImGui::TextWrapped("[%d] %s", current, seg(current).text.c_str());
+        ImGui::Spacing();
+        auto it = explanations.find(current);
+        if (it == explanations.end()) {
+            ImGui::TextDisabled(running ? "이 문장의 해설을 기다리는 중..." : "아직 해설이 없습니다. [이 문장 해설]을 누르세요.");
+            return;
+        }
+        const Explanation& ex = it->second;
+        ImGui::TextColored(ImVec4(0.6f, 0.8f, 1.0f, 1.0f), "번역");
+        ImGui::TextWrapped("%s", ex.translation.c_str());
+        ImGui::Spacing();
+        ImGui::TextColored(ImVec4(0.6f, 0.8f, 1.0f, 1.0f), "표현");
+        for (size_t k = 0; k < ex.expressions.size(); ++k) {
+            const auto& e = ex.expressions[k];
+            ImGui::PushID((int)k);
+            bool saved = db.hasExpression(video.id, current, e.text);
+            ImGui::TextColored(ImVec4(1.0f, 0.9f, 0.5f, 1.0f), "%s", e.text.c_str());
+            ImGui::SameLine();
+            if (saved) ImGui::TextDisabled("저장됨");
+            else if (ImGui::SmallButton("저장")) saveExpression(current, e);
+            ImGui::TextWrapped("뜻: %s", e.meaning.c_str());
+            if (!e.note.empty()) ImGui::TextWrapped("%s", e.note.c_str());
+            if (!e.example.empty()) { ImGui::TextDisabled("예: "); ImGui::SameLine(); ImGui::TextWrapped("%s", e.example.c_str()); }
+            ImGui::Spacing();
+            ImGui::PopID();
+        }
+        if (!ex.grammar.empty()) {
+            ImGui::TextColored(ImVec4(0.6f, 0.8f, 1.0f, 1.0f), "문법");
+            ImGui::TextWrapped("%s", ex.grammar.c_str());
+        }
+        ImGui::Spacing();
+        ImGui::TextDisabled("%s · %s", ex.provider.c_str(), ex.model.c_str());
+        ImGui::SameLine();
+        if (ImGui::SmallButton("다시 생성")) { explained.erase(current); explanations.erase(current); requestExplain({current}); }
+    }
+
+    // 표현 노트 탭: 저장한 표현 카드 전체
+    void drawCardsTab() {
+        if (cardsDirty) { cards = db.expressions(); cardsDirty = false; }
+        ImGui::TextDisabled("저장한 표현 %d개  |  복습 시점이 되면 홈의 [복습 시작]에 문장과 함께 나옵니다", (int)cards.size());
+        ImGui::Separator();
+        if (cards.empty()) { ImGui::TextDisabled("[표현] 탭에서 해설을 만들고 [저장]을 누르면 여기에 모입니다."); return; }
+        for (size_t k = 0; k < cards.size(); ++k) {
+            const auto& c = cards[k];
+            ImGui::PushID((int)c.id);
+            ImGui::TextColored(ImVec4(1.0f, 0.9f, 0.5f, 1.0f), "%s", c.text.c_str());
+            ImGui::SameLine();
+            ImGui::TextDisabled("(%d회, 다음 %s)", c.reviews, c.dueAt.substr(0, 10).c_str());
+            ImGui::SameLine();
+            if (ImGui::SmallButton("문장")) {
+                ReviewItem it; it.videoId = c.videoId; it.segIdx = c.segIdx;
+                openReviewItem(it);
+            }
+            ImGui::SameLine();
+            if (ImGui::SmallButton("삭제")) { db.deleteExpression(c.id); cardsDirty = true; }
+            ImGui::TextWrapped("%s", c.meaning.c_str());
+            if (!c.example.empty()) { ImGui::TextDisabled("예: "); ImGui::SameLine(); ImGui::TextWrapped("%s", c.example.c_str()); }
+            ImGui::Spacing();
+            ImGui::PopID();
+        }
+    }
+
+    // AI 설정 창
+    void drawSettings() {
+        if (showSettings && !ImGui::IsPopupOpen("AI 설정")) ImGui::OpenPopup("AI 설정");
+        ImGui::SetNextWindowSize(ImVec2(720 * uiScale, 0));
+        if (!ImGui::BeginPopupModal("AI 설정", &showSettings, ImGuiWindowFlags_AlwaysAutoResize)) return;
+        bool jobRunning;
+        { std::lock_guard<std::mutex> lock(llmJob.m); jobRunning = llmJob.running; }
+
+        ImGui::TextWrapped("문장 해설(번역, 표현, 문법)에 쓸 AI 를 고르고 API 키를 넣으세요. 키는 이 PC 의 사용자 계정으로만 풀 수 있게 암호화해서 저장합니다.");
+        ImGui::Spacing();
+        ImGui::TextDisabled("사용할 서비스");
+        ImGui::RadioButton("Claude (Anthropic)", &providerSel, 0); ImGui::SameLine();
+        ImGui::RadioButton("ChatGPT (OpenAI)", &providerSel, 1); ImGui::SameLine();
+        ImGui::RadioButton("Gemini (Google)", &providerSel, 2);
+        ImGui::Separator();
+
+        const char* names[3] = {"Claude", "ChatGPT", "Gemini"};
+        const char* keyHints[3] = {"sk-ant-...  (console.anthropic.com)", "sk-...  (platform.openai.com)", "AIza...  (aistudio.google.com)"};
+        for (int p = 0; p < 3; ++p) {
+            ImGui::PushID(p);
+            bool active = (p == providerSel);
+            if (!active) ImGui::BeginDisabled();
+            ImGui::TextColored(active ? ImVec4(0.6f, 0.8f, 1.0f, 1.0f) : ImVec4(0.5f, 0.5f, 0.5f, 1.0f), "%s", names[p]);
+            ImGui::SetNextItemWidth(420 * uiScale);
+            ImGui::InputTextWithHint("API 키", keyHints[p], keyBuf[p], sizeof keyBuf[p], ImGuiInputTextFlags_Password);
+            ImGui::SetNextItemWidth(300 * uiScale);
+            ImGui::InputText("모델", modelBuf[p], sizeof modelBuf[p]);
+            ImGui::SameLine();
+            ImGui::BeginDisabled(jobRunning);
+            if (ImGui::Button("모델 목록")) startModelList(p);
+            ImGui::EndDisabled();
+            if (!modelList[p].empty()) {
+                ImGui::SameLine();
+                ImGui::SetNextItemWidth(300 * uiScale);
+                if (ImGui::BeginCombo("##models", "목록에서 선택")) {
+                    for (const auto& m : modelList[p]) if (ImGui::Selectable(m.c_str())) snprintf(modelBuf[p], sizeof modelBuf[p], "%s", m.c_str());
+                    ImGui::EndCombo();
+                }
+            }
+            if (!active) ImGui::EndDisabled();
+            ImGui::Spacing();
+            ImGui::PopID();
+        }
+        ImGui::Separator();
+        ImGui::BeginDisabled(jobRunning);
+        if (ImGui::Button("연결 테스트")) startConnectionTest();
+        ImGui::EndDisabled();
+        ImGui::SameLine();
+        if (ImGui::Button("저장")) { applySettings(); settingsMsg = "저장했습니다"; }
+        ImGui::SameLine();
+        if (ImGui::Button("닫기")) { showSettings = false; ImGui::CloseCurrentPopup(); }
+        ImGui::SameLine();
+        if (jobRunning) ImGui::TextColored(ImVec4(1, 0.8f, 0.3f, 1), "요청 중...");
+        else if (!settingsMsg.empty()) ImGui::TextWrapped("%s", settingsMsg.c_str());
+        ImGui::EndPopup();
+    }
+
     void drawRightPanel(ImVec2 size) {
         ImGui::BeginChild("right", size, ImGuiChildFlags_Borders);
         if (reviewDirty) {
@@ -944,9 +1286,21 @@ struct App {
                 ImGui::EndChild();
                 ImGui::EndTabItem();
             }
-            if (ImGui::BeginTabItem("기록")) {
+            if (ImGui::BeginTabItem("기록", nullptr, forceTab == Tab::History ? ImGuiTabItemFlags_SetSelected : 0)) {
                 ImGui::BeginChild("history");
                 drawHistoryList();
+                ImGui::EndChild();
+                ImGui::EndTabItem();
+            }
+            if (ImGui::BeginTabItem("표현", nullptr, forceTab == Tab::Explain ? ImGuiTabItemFlags_SetSelected : 0)) {
+                ImGui::BeginChild("explain");
+                drawExplainTab();
+                ImGui::EndChild();
+                ImGui::EndTabItem();
+            }
+            if (ImGui::BeginTabItem("표현 노트", nullptr, forceTab == Tab::Cards ? ImGuiTabItemFlags_SetSelected : 0)) {
+                ImGui::BeginChild("cards");
+                drawCardsTab();
                 ImGui::EndChild();
                 ImGui::EndTabItem();
             }
@@ -1085,9 +1439,10 @@ struct App {
         ImGui::BeginChild("stats", ImVec2(rightW, avail.y), ImGuiChildFlags_Borders);
         ImGui::TextColored(ImVec4(0.6f, 0.8f, 1.0f, 1.0f), "오늘");
         ImGui::Separator();
-        int due = db.dueCount();
-        if (due > 0) ImGui::TextColored(ImVec4(1, 0.85f, 0.4f, 1), "복습할 문장 %d개", due);
-        else ImGui::TextDisabled("복습할 문장이 없습니다");
+        int dueSeg = db.dueCount(), dueExpr = db.dueExpressionCount();
+        int due = dueSeg + dueExpr;
+        if (due > 0) ImGui::TextColored(ImVec4(1, 0.85f, 0.4f, 1), "복습할 항목 %d개 (문장 %d · 표현 %d)", due, dueSeg, dueExpr);
+        else ImGui::TextDisabled("복습할 항목이 없습니다");
         ImGui::SameLine();
         ImGui::BeginDisabled(due == 0);
         if (ImGui::Button("복습 시작")) startSession();
@@ -1114,12 +1469,23 @@ struct App {
 
         // 복습 세션 배너
         if (session.active) {
-            ImGui::TextColored(ImVec4(1, 0.85f, 0.4f, 1), "복습 세션 %d / %d   (어려움 %d · 보통 %d · 쉬움 %d)   아래 [어려움/보통/쉬움] 을 누르면 다음 문장으로 넘어갑니다",
+            ImGui::TextColored(ImVec4(1, 0.85f, 0.4f, 1), "복습 세션 %d / %d   (어려움 %d · 보통 %d · 쉬움 %d)   아래 [어려움/보통/쉬움] 을 누르면 다음으로 넘어갑니다",
                                (int)session.pos + 1, (int)session.queue.size(), session.hard, session.good, session.easy);
             ImGui::SameLine(0, 16);
             if (ImGui::SmallButton("건너뛰기")) sessionSkip();
             ImGui::SameLine();
             if (ImGui::SmallButton("세션 종료")) endSession();
+            // 표현 카드: 앞면(표현) → [뜻 보기] → 뒷면(뜻, 예문)
+            if (session.pos < session.queue.size() && session.queue[session.pos].expressionId > 0) {
+                const auto& it = session.queue[session.pos];
+                ImGui::TextColored(ImVec4(1.0f, 0.9f, 0.5f, 1.0f), "표현 카드:  %s", it.text.c_str());
+                ImGui::SameLine();
+                if (!cardRevealed) { if (ImGui::SmallButton("뜻 보기")) cardRevealed = true; }
+                else {
+                    ImGui::TextWrapped("뜻: %s   %s", it.meaning.c_str(), it.note.c_str());
+                    if (!it.example.empty()) ImGui::TextWrapped("예: %s", it.example.c_str());
+                }
+            }
         }
 
         ImGui::BeginDisabled(!can);
@@ -1257,6 +1623,10 @@ struct App {
         else if (cmd == "record") startRecordOnly(std::max(0, current));
         else if (cmd == "stop") stopAll();
         else if (cmd == "home") goHome();
+        else if (cmd == "explain" && valid(current)) requestExplain({current});
+        else if (cmd == "explain_all") requestExplainAll();
+        else if (cmd == "settings") showSettings = true;
+        else if (cmd == "tab") forceTab = arg == "explain" ? Tab::Explain : arg == "cards" ? Tab::Cards : arg == "review" ? Tab::Review : arg == "history" ? Tab::History : Tab::Sentences;
         else if (cmd == "rescore" && valid(current) && stt.loaded()) {
             // 현재 문장의 마지막 녹음을 다시 채점 (마이크 없이 채점 화면 확인용)
             std::string path = db.lastRecording(video.id, current);
@@ -1309,6 +1679,8 @@ struct App {
         if (ImGui::Button("불러오기") || enter) requestLoad(urlBuf);
         ImGui::EndDisabled();
         ImGui::SameLine(0, 16);
+        if (ImGui::Button(llm.ready() ? "AI 설정" : "AI 설정 (키 없음)")) showSettings = true;
+        ImGui::SameLine(0, 16);
         if (!stt.loaded()) {
             if (sttBusy) ImGui::TextColored(ImVec4(1, 0.8f, 0.3f, 1), "%s", sttStatus.c_str());
             else if (ImGui::Button("STT 모델 받기 (148MB, 채점/자막 생성용)")) sttLoader.start(&stt, true);
@@ -1334,6 +1706,8 @@ struct App {
             drawRightPanel(ImVec2(rightW, avail.y - bottomH - 8));
             drawControls(ImVec2(avail.x, bottomH));
         }
+
+        drawSettings();
 
         // 알림 팝업
         if (!infoPopup.empty() && !ImGui::IsPopupOpen("알림")) ImGui::OpenPopup("알림");
@@ -1431,6 +1805,7 @@ int main(int argc, char** argv) {
         return 1;
     }
     app.db.importTsv(paths::dataDir() + "\\practice.tsv");
+    app.loadSettings();
     if (fs::exists(Stt::defaultModelPath())) app.sttLoader.start(&app.stt, false);
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];

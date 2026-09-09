@@ -25,6 +25,11 @@
   - 녹음만: 원본 듣기 없이 바로 녹음 (같은 문장 반복 연습)
   - 무음 감지 자동 종료 (배경 소음을 재서 감도 자동 조절), Space 로 수동 종료
 - **채점**: 내 녹음을 whisper 로 텍스트화해서 원문과 단어 단위로 정렬. 정확도 % 와 맞음 / 빠짐 / 다르게 들림 / 추가로 들림 표시. 추임새("uh", "um")와 효과음 표기는 제외
+- **AI 표현 해설** (Claude / ChatGPT / Gemini 중 선택, 본인 API 키 사용)
+  - 문장마다 한국어 번역, 배울 만한 표현(뜻 · 뉘앙스 · 예문), 문법 포인트를 생성. 앞뒤 문장을 문맥으로 함께 보냄
+  - 한 문장씩 또는 영상 전체를 한 번에 생성하고 DB 에 캐시
+  - 마음에 드는 표현은 [저장] → 표현 노트에 모이고, 간격 반복으로 복습 세션에 카드로 나온다 (앞면 표현 → 뜻 보기 → 평가)
+  - API 키는 Windows DPAPI 로 암호화해 이 PC 의 사용자 계정으로만 풀 수 있게 저장
 - **기록과 복습** (SQLite)
   - 홈: 영상별 진행률, 연습 횟수, 평균 점수, 마지막 연습, 최근 30일 그래프, 연속 학습일
   - 문장별 연습 이력과 예전 녹음 다시 듣기, 북마크
@@ -104,6 +109,14 @@ run-gui.cmd https://www.youtube.com/watch?v=VIDEO_ID
 | T | 녹음만 |
 | B | 북마크 |
 
+### AI 표현 해설 설정
+
+상단 [AI 설정]에서 Claude(Anthropic) / ChatGPT(OpenAI) / Gemini(Google) 중 하나를 고르고 API 키를 넣습니다. [모델 목록]으로 사용 가능한 모델을 받아 고를 수 있고 [연결 테스트]로 확인합니다.
+
+- 키 발급: console.anthropic.com / platform.openai.com / aistudio.google.com
+- 비용은 각 서비스에 본인 계정으로 청구됩니다. 문장 하나에 입력·출력 합쳐 수백 토큰 수준입니다.
+- 학습 화면 오른쪽 [표현] 탭에서 [이 문장 해설] 또는 [모든 문장 해설]. 결과는 캐시되어 다시 요청하지 않습니다. 표현 옆 [저장]을 누르면 [표현 노트]에 모이고 복습 세션에 카드로 나옵니다.
+
 ### 데이터 위치
 
 ```
@@ -130,7 +143,10 @@ src/
   stt.cpp         whisper.cpp 래퍼 (단어 타임스탬프 / 텍스트)
   scoring.cpp     원문 vs 인식 결과 편집 거리 정렬, 정확도
   audio.cpp       miniaudio 녹음/재생, 파형 피크, 리샘플
-  db.cpp          SQLite 저장소, 간격 반복, 통계
+  db.cpp          SQLite 저장소, 간격 반복, 통계, 설정, 해설 캐시, 표현 카드
+  llm.cpp         Claude / OpenAI / Gemini REST 호출, 문장 해설 프롬프트
+  http.cpp        WinHTTP 기반 HTTPS 클라이언트
+  secret.cpp      DPAPI 로 API 키 암호화
   paths.cpp       데이터/모델 경로, 동봉 도구 PATH, 숨김 프로세스 실행
   main.cpp        CLI 버전 (초기 프로토타입)
   stt_test.cpp    STT + 채점 검증 도구
@@ -140,7 +156,7 @@ installer/youshadow.iss  Inno Setup 스크립트
 .github/workflows/release.yml  태그 push 시 자동 빌드 · Release
 ```
 
-테스트용으로 `youshadow-gui.exe --script cmds.txt` 를 주면 `load <id>` / `wait <초>` / `play <n>` / `echo <n>` / `record` / `home` / `review` / `rate hard|good|easy` / `quit` 명령을 순서대로 실행합니다. 시연 GIF 도 이 방식으로 찍었습니다.
+테스트용으로 `youshadow-gui.exe --script cmds.txt` 를 주면 `load <id>` / `wait <초>` / `play <n>` / `echo <n>` / `record` / `home` / `review` / `rate hard|good|easy` / `explain` / `explain_all` / `settings` / `tab <name>` / `quit` 명령을 순서대로 실행합니다. 시연 GIF 도 이 방식으로 찍었습니다. `llm_test.exe <claude|openai|gemini> <API키>` 는 문장 해설 한 번을 콘솔에서 시험합니다.
 
 ## 알아 둘 것
 

@@ -27,6 +27,7 @@ public:
     bool step() { return sqlite3_step(st_) == SQLITE_ROW; }
     void run() { sqlite3_step(st_); }
     int colInt(int i) const { return sqlite3_column_int(st_, i); }
+    long long colInt64(int i) const { return sqlite3_column_int64(st_, i); }
     double colDouble(int i) const { return sqlite3_column_double(st_, i); }
     bool colNull(int i) const { return sqlite3_column_type(st_, i) == SQLITE_NULL; }
     std::string colText(int i) const {
@@ -53,6 +54,14 @@ CREATE TABLE IF NOT EXISTS segment_state(
   PRIMARY KEY(video_id, seg_idx));
 CREATE INDEX IF NOT EXISTS idx_practices_video ON practices(video_id, seg_idx);
 CREATE INDEX IF NOT EXISTS idx_state_due ON segment_state(due_at);
+CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY, value TEXT);
+CREATE TABLE IF NOT EXISTS explanations(
+  video_id TEXT, seg_idx INTEGER, json TEXT, created_at TEXT, PRIMARY KEY(video_id, seg_idx));
+CREATE TABLE IF NOT EXISTS expressions(
+  id INTEGER PRIMARY KEY AUTOINCREMENT, video_id TEXT, seg_idx INTEGER,
+  text TEXT, meaning TEXT, note TEXT, example TEXT, created_at TEXT,
+  ease REAL DEFAULT 2.5, interval_days REAL DEFAULT 0, due_at TEXT, reviews INTEGER DEFAULT 0, lapses INTEGER DEFAULT 0);
+CREATE INDEX IF NOT EXISTS idx_expr_due ON expressions(due_at);
 )";
 
 const char* kReviewSelect =
@@ -315,6 +324,134 @@ void Db::deleteVideo(const std::string& videoId) {
     Stmt(db_, "DELETE FROM segments WHERE video_id = ?").bind(1, videoId).run();
     Stmt(db_, "DELETE FROM videos WHERE id = ?").bind(1, videoId).run();
     exec("COMMIT");
+}
+
+// ---------------- 설정 / 해설 / 표현 카드 ----------------
+
+std::string Db::getSetting(const std::string& key, const std::string& def) const {
+    Stmt st(db_, "SELECT value FROM settings WHERE key=?");
+    st.bind(1, key);
+    return st.step() ? st.colText(0) : def;
+}
+
+void Db::setSetting(const std::string& key, const std::string& value) {
+    Stmt(db_, "INSERT INTO settings(key, value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value")
+        .bind(1, key).bind(2, value).run();
+}
+
+std::string Db::getExplanation(const std::string& videoId, int segIdx) const {
+    Stmt st(db_, "SELECT json FROM explanations WHERE video_id=? AND seg_idx=?");
+    st.bind(1, videoId).bind(2, segIdx);
+    return st.step() ? st.colText(0) : "";
+}
+
+void Db::setExplanation(const std::string& videoId, int segIdx, const std::string& json) {
+    Stmt(db_, "INSERT OR REPLACE INTO explanations(video_id, seg_idx, json, created_at) VALUES(?,?,?,?)")
+        .bind(1, videoId).bind(2, segIdx).bind(3, json).bind(4, now()).run();
+}
+
+std::set<int> Db::explainedSegments(const std::string& videoId) const {
+    std::set<int> out;
+    Stmt st(db_, "SELECT seg_idx FROM explanations WHERE video_id=?");
+    st.bind(1, videoId);
+    while (st.step()) out.insert(st.colInt(0));
+    return out;
+}
+
+long long Db::addExpression(const std::string& videoId, int segIdx, const std::string& text,
+                            const std::string& meaning, const std::string& note, const std::string& example) {
+    Stmt(db_, "INSERT INTO expressions(video_id, seg_idx, text, meaning, note, example, created_at, interval_days, due_at) "
+              "VALUES(?,?,?,?,?,?,?,1,?)")
+        .bind(1, videoId).bind(2, segIdx).bind(3, text).bind(4, meaning).bind(5, note).bind(6, example)
+        .bind(7, now()).bind(8, fromNow(1)).run();
+    return sqlite3_last_insert_rowid(db_);
+}
+
+void Db::deleteExpression(long long id) {
+    Stmt(db_, "DELETE FROM expressions WHERE id=?").bind(1, id).run();
+}
+
+bool Db::hasExpression(const std::string& videoId, int segIdx, const std::string& text) const {
+    Stmt st(db_, "SELECT 1 FROM expressions WHERE video_id=? AND seg_idx=? AND text=? LIMIT 1");
+    st.bind(1, videoId).bind(2, segIdx).bind(3, text);
+    return st.step();
+}
+
+std::vector<ExpressionCard> Db::expressions(int limit) const {
+    std::vector<ExpressionCard> out;
+    Stmt st(db_, "SELECT id, video_id, seg_idx, text, meaning, note, example, created_at, COALESCE(due_at,''), reviews, interval_days "
+                 "FROM expressions ORDER BY id DESC LIMIT ?");
+    st.bind(1, limit);
+    while (st.step()) {
+        ExpressionCard c;
+        c.id = st.colInt64(0);
+        c.videoId = st.colText(1);
+        c.segIdx = st.colInt(2);
+        c.text = st.colText(3);
+        c.meaning = st.colText(4);
+        c.note = st.colText(5);
+        c.example = st.colText(6);
+        c.createdAt = st.colText(7);
+        c.dueAt = st.colText(8);
+        c.reviews = st.colInt(9);
+        c.intervalDays = st.colDouble(10);
+        out.push_back(c);
+    }
+    return out;
+}
+
+std::vector<ReviewItem> Db::dueExpressions(int limit) const {
+    std::vector<ReviewItem> out;
+    Stmt st(db_, "SELECT e.id, e.video_id, COALESCE(v.title, e.video_id), e.seg_idx, COALESCE(g.start_ms, 0), COALESCE(g.text, ''), "
+                 "e.due_at, e.text, e.meaning, e.note, e.example "
+                 "FROM expressions e LEFT JOIN segments g ON g.video_id=e.video_id AND g.idx=e.seg_idx "
+                 "LEFT JOIN videos v ON v.id=e.video_id "
+                 "WHERE e.due_at IS NOT NULL AND e.due_at <= ? ORDER BY e.due_at LIMIT ?");
+    st.bind(1, now()).bind(2, limit);
+    while (st.step()) {
+        ReviewItem it;
+        it.expressionId = st.colInt64(0);
+        it.videoId = st.colText(1);
+        it.title = st.colText(2);
+        it.segIdx = st.colInt(3);
+        it.startMs = st.colInt(4);
+        const std::string sentence = st.colText(5);
+        it.dueAt = st.colText(6);
+        it.text = st.colText(7);        // 카드 앞면 = 표현
+        it.meaning = st.colText(8);
+        it.note = st.colText(9);
+        it.example = st.colText(10);
+        if (it.example.empty()) it.example = sentence;  // 예문이 없으면 원문 문장
+        out.push_back(it);
+    }
+    return out;
+}
+
+int Db::dueExpressionCount() const {
+    Stmt st(db_, "SELECT COUNT(*) FROM expressions WHERE due_at IS NOT NULL AND due_at <= ?");
+    st.bind(1, now());
+    return st.step() ? st.colInt(0) : 0;
+}
+
+void Db::rateExpression(long long id, Grade grade) {
+    Stmt sel(db_, "SELECT ease, interval_days, reviews, lapses FROM expressions WHERE id=?");
+    sel.bind(1, id);
+    if (!sel.step()) return;
+    double ease = sel.colDouble(0), interval = sel.colDouble(1);
+    int reviews = sel.colInt(2), lapses = sel.colInt(3);
+    if (grade == Hard) {
+        ease = std::max(1.3, ease - 0.2);
+        interval = 0.5;
+        lapses++;
+    } else {
+        if (reviews == 0) interval = 1;
+        else if (reviews == 1) interval = 3;
+        else interval = std::max(1.0, interval * ease);
+        if (grade == Easy) { interval *= 1.3; ease += 0.15; }
+    }
+    reviews++;
+    Stmt(db_, "UPDATE expressions SET ease=?, interval_days=?, due_at=?, reviews=?, lapses=? WHERE id=?")
+        .bind(1, ease).bind(2, interval).bind(3, fromNow(interval)).bind(4, reviews).bind(5, lapses).bind(6, id).run();
 }
 
 // ---------------- TSV 가져오기 ----------------

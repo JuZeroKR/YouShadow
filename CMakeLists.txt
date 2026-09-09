@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(YouShadow VERSION 0.1.0 LANGUAGES C CXX)
+project(YouShadow VERSION 0.2.0 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -43,9 +43,12 @@ add_library(ys_core STATIC
     src/db.cpp
     src/stt.cpp
     src/scoring.cpp
+    src/http.cpp
+    src/secret.cpp
+    src/llm.cpp
 )
 target_include_directories(ys_core PUBLIC ${TP} src)
-target_link_libraries(ys_core PUBLIC ys_options sqlite3 whisper)
+target_link_libraries(ys_core PUBLIC ys_options sqlite3 whisper winhttp crypt32)
 
 # ---- Dear ImGui + GLFW 백엔드 ----
 set(IMGUI ${TP}/imgui)
@@ -67,6 +70,10 @@ target_link_libraries(youshadow-cli PRIVATE ys_core)
 # ---- STT/채점 검증 도구 ----
 add_executable(stt_test src/stt_test.cpp)
 target_link_libraries(stt_test PRIVATE ys_core)
+
+# ---- LLM 연동 검증 도구 ----
+add_executable(llm_test src/llm_test.cpp)
+target_link_libraries(llm_test PRIVATE ys_core)
 
 # ---- GUI (콘솔 창 없는 Windows 앱, 진입점은 main) ----
 add_executable(youshadow-gui WIN32

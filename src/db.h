@@ -33,6 +33,20 @@ struct ReviewItem {
     int startMs = 0;
     std::string text;
     std::string dueAt;
+    // 표현 카드일 때 (expressionId > 0)
+    long long expressionId = 0;
+    std::string meaning, note, example;
+};
+
+// 저장한 표현 카드
+struct ExpressionCard {
+    long long id = 0;
+    std::string videoId;
+    int segIdx = 0;
+    std::string text, meaning, note, example;
+    std::string createdAt, dueAt;
+    int reviews = 0;
+    double intervalDays = 0;
 };
 
 // 라이브러리 화면용 영상 요약
@@ -99,6 +113,25 @@ public:
     std::vector<PracticeHistory> practicesFor(const std::string& videoId, int segIdx) const;
     int totalPractices() const;
     void deleteVideo(const std::string& videoId);        // 영상과 관련 기록 전부 삭제
+
+    // 설정 (key/value)
+    std::string getSetting(const std::string& key, const std::string& def = "") const;
+    void setSetting(const std::string& key, const std::string& value);
+
+    // 문장 해설 캐시 (LLM 결과 JSON)
+    std::string getExplanation(const std::string& videoId, int segIdx) const;
+    void setExplanation(const std::string& videoId, int segIdx, const std::string& json);
+    std::set<int> explainedSegments(const std::string& videoId) const;
+
+    // 표현 카드 (간격 반복 포함)
+    long long addExpression(const std::string& videoId, int segIdx, const std::string& text,
+                            const std::string& meaning, const std::string& note, const std::string& example);
+    void deleteExpression(long long id);
+    bool hasExpression(const std::string& videoId, int segIdx, const std::string& text) const;
+    std::vector<ExpressionCard> expressions(int limit = 1000) const;
+    std::vector<ReviewItem> dueExpressions(int limit = 200) const;
+    int dueExpressionCount() const;
+    void rateExpression(long long id, Grade grade);
 
     // 이전 버전의 practice.tsv 가져오기 (이력이 비어 있을 때만)
     void importTsv(const std::string& path);
