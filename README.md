@@ -129,3 +129,7 @@ scripts/setup-deps.ps1   의존성 설치
 - 문장 편집 (분할 / 병합)
 - 더 큰 whisper 모델 선택 (small.en), GPU 가속
 - 억양 · 속도 비교, 음소 단위 발음 피드백
+
+## 라이선스
+
+[MIT](LICENSE). 시연에 쓰인 영상은 TED 의 "Why Social Health Is Key to Happiness and Longevity | Kasley Killam" 이며 저작권은 TED 에 있습니다.
