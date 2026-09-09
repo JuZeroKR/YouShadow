@@ -1,10 +1,11 @@
-# YouShadow 의존성 설치 스크립트 (Windows / PowerShell)
+﻿# YouShadow 의존성 설치 스크립트 (Windows / PowerShell)
 # third_party/ 아래에 빌드에 필요한 라이브러리를 받아 놓는다. 저장소에는 포함하지 않는다.
 #
 #   powershell -ExecutionPolicy Bypass -File scripts\setup-deps.ps1
 #
 # 필요: git, curl (Windows 10+ 기본 포함), Visual Studio 2022 (libmpv import lib 생성용 lib.exe)
 
+param([switch]$NoModel)   # -NoModel: whisper 모델 다운로드 생략 (CI 용)
 $ErrorActionPreference = "Stop"
 $root = Split-Path -Parent (Split-Path -Parent $MyInvocation.MyCommand.Path)
 $tp = Join-Path $root "third_party"
@@ -79,7 +80,7 @@ if (-not (Test-Path "mpv\libmpv.lib")) {
 
 # 7. whisper 모델 (선택, 148MB). 앱에서도 받을 수 있다.
 $model = Join-Path $root "models\ggml-base.en.bin"
-if (-not (Test-Path $model)) {
+if (-not $NoModel -and -not (Test-Path $model)) {
     Step "whisper 모델 ggml-base.en.bin (148MB)"
     New-Item -ItemType Directory -Force (Split-Path $model) | Out-Null
     curl.exe -L -o $model "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.en.bin"

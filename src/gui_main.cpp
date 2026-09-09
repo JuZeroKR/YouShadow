@@ -25,6 +25,7 @@
 
 #include "audio.h"
 #include "db.h"
+#include "paths.h"
 #include "player.h"
 #include "scoring.h"
 #include "stt.h"
@@ -72,8 +73,7 @@ struct Loader {
             std::string err;
             try {
                 v.id = id;
-                v.dir = "data/" + id;
-                fs::create_directories("data");
+                v.dir = paths::dataDir() + "\\" + id;
                 auto dl = yt::download(id, v.dir);
                 v.title = dl.title.empty() ? id : dl.title;
                 v.videoPath = fs::absolute(dl.videoPath).string();
@@ -137,7 +137,9 @@ struct SttLoader {
                     fs::create_directories(fs::path(path).parent_path());
                     std::string part = path + ".part";
                     std::string cmd = "curl -L --fail -o \"" + part + "\" \"" + Stt::modelUrl() + "\"";
-                    if (std::system(cmd.c_str()) != 0 || !fs::exists(part)) throw std::runtime_error("모델 다운로드 실패 (curl)");
+                    if (paths::runCommand(cmd, yt::logPath()) != 0 || !fs::exists(part)) {
+                        throw std::runtime_error("모델 다운로드 실패. 로그: " + yt::logPath());
+                    }
                     fs::rename(part, path);
                 }
                 { std::lock_guard<std::mutex> lock(m); status = "STT 모델 로딩 중..."; }
@@ -1367,10 +1369,28 @@ struct App {
 
 void glfwError(int code, const char* desc) { fprintf(stderr, "GLFW error %d: %s\n", code, desc); }
 
+// 처리되지 않은 예외(크래시)를 logs\crash.log 에 남기고 안내창을 띄운다
+LONG WINAPI crashHandler(EXCEPTION_POINTERS* ep) {
+    char buf[512];
+    snprintf(buf, sizeof buf, "YouShadow v%s crashed: exception 0x%08lX at %p\r\n", YS_VERSION,
+             ep && ep->ExceptionRecord ? ep->ExceptionRecord->ExceptionCode : 0,
+             ep && ep->ExceptionRecord ? ep->ExceptionRecord->ExceptionAddress : nullptr);
+    std::string path = paths::logDir() + "\\crash.log";
+    if (FILE* f = fopen(path.c_str(), "ab")) { fputs(buf, f); fclose(f); }
+    MessageBoxA(nullptr, (std::string("프로그램에 문제가 생겨 종료합니다.\n\n") + buf + "\n로그: " + path).c_str(), "YouShadow", MB_ICONERROR);
+    return EXCEPTION_EXECUTE_HANDLER;
+}
+
 }  // namespace
+
+#ifndef YS_VERSION
+#define YS_VERSION "dev"
+#endif
 
 int main(int argc, char** argv) {
     SetConsoleOutputCP(CP_UTF8);
+    paths::setup();
+    SetUnhandledExceptionFilter(crashHandler);
 
     glfwSetErrorCallback(glfwError);
     if (!glfwInit()) return 1;
@@ -1378,7 +1398,7 @@ int main(int argc, char** argv) {
     glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 0);
     glfwWindowHint(GLFW_MAXIMIZED, GLFW_TRUE);
     glfwWindowHint(GLFW_SCALE_TO_MONITOR, GLFW_TRUE);
-    GLFWwindow* window = glfwCreateWindow(1280, 800, "YouShadow", nullptr, nullptr);
+    GLFWwindow* window = glfwCreateWindow(1280, 800, "YouShadow v" YS_VERSION, nullptr, nullptr);
     if (!window) return 1;
     glfwMakeContextCurrent(window);
     glfwSwapInterval(1);
@@ -1403,15 +1423,14 @@ int main(int argc, char** argv) {
     app.window = window;
     std::string err;
     if (!app.mpv.init([](const char* n) { return (void*)glfwGetProcAddress(n); }, &err)) {
-        fprintf(stderr, "mpv init failed: %s\n", err.c_str());
+        MessageBoxA(nullptr, ("영상 재생기(libmpv) 초기화 실패: " + err).c_str(), "YouShadow", MB_ICONERROR);
         return 1;
     }
-    fs::create_directories("data");
-    if (!app.db.open("data/youshadow.db", &err)) {
-        fprintf(stderr, "db open failed: %s\n", err.c_str());
+    if (!app.db.open(paths::dataDir() + "\\youshadow.db", &err)) {
+        MessageBoxA(nullptr, err.c_str(), "YouShadow", MB_ICONERROR);
         return 1;
     }
-    app.db.importTsv("data/practice.tsv");
+    app.db.importTsv(paths::dataDir() + "\\practice.tsv");
     if (fs::exists(Stt::defaultModelPath())) app.sttLoader.start(&app.stt, false);
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];

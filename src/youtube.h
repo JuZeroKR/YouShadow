@@ -18,4 +18,7 @@ struct DownloadResult {
 // 이미 있으면 다시 받지 않는다.
 DownloadResult download(const std::string& videoId, const std::string& dir);
 
+// 외부 도구(yt-dlp, ffmpeg, curl) 출력이 기록되는 로그 파일
+std::string logPath();
+
 }  // namespace yt

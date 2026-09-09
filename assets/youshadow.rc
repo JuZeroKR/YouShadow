@@ -1,0 +1,2 @@
+// GLFW 는 "GLFW_ICON" 이름의 아이콘 리소스를 창/작업 표시줄 아이콘으로 자동 사용한다.
+GLFW_ICON ICON "youshadow.ico"

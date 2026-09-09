@@ -1,10 +1,10 @@
 #include "youtube.h"
 
-#include <cstdlib>
 #include <filesystem>
 #include <fstream>
-#include <iostream>
 #include <regex>
+
+#include "paths.h"
 
 namespace fs = std::filesystem;
 
@@ -46,18 +46,15 @@ static std::string readTitle(const std::string& dir) {
     return title;
 }
 
-static int run(const std::string& cmd) {
-    std::cout.flush();
-    return std::system(cmd.c_str());
-}
+std::string logPath() { return paths::logDir() + "\\tools.log"; }
 
 DownloadResult download(const std::string& videoId, const std::string& dir) {
     fs::create_directories(dir);
     const std::string video = dir + "/video.mp4";
     const std::string audio = dir + "/audio.wav";
+    const std::string log = logPath();
 
     if (!fs::exists(video)) {
-        std::cout << "[다운로드] yt-dlp 실행 중... (영상 720p + 영어 자막)" << std::endl;
         // -i: 자막 다운로드가 실패해도(유튜브가 자막 요청을 429 로 막는 경우가 잦다) 영상은 받는다.
         // 자막이 없으면 호출 측에서 whisper 로 대본을 만든다.
         std::string cmd =
@@ -69,21 +66,20 @@ DownloadResult download(const std::string& videoId, const std::string& dir) {
             "--print-to-file \"%(title)s\" \"" + dir + "/title.txt\" "
             "-o \"" + dir + "/video.%(ext)s\" "
             "\"https://www.youtube.com/watch?v=" + videoId + "\"";
-        int rc = run(cmd);
+        int rc = paths::runCommand(cmd, log);
         if (!fs::exists(video)) {
             throw std::runtime_error(
                 "yt-dlp 로 영상을 받지 못했습니다 (exit code " + std::to_string(rc) +
-                "). 콘솔 창의 오류를 확인하세요. 비공개/연령 제한 영상이거나 yt-dlp 업데이트가 필요할 수 있습니다");
+                "). 로그: " + log + "\n비공개/연령 제한 영상이거나 yt-dlp 업데이트가 필요할 수 있습니다");
         }
     }
 
     if (!fs::exists(audio)) {
-        std::cout << "[오디오] ffmpeg로 wav 추출 중..." << std::endl;
         std::string cmd = "ffmpeg -y -loglevel error -i \"" + video +
                           "\" -vn -ac 1 -ar 16000 -f wav \"" + audio + "\"";
-        int rc = run(cmd);
+        int rc = paths::runCommand(cmd, log);
         if (rc != 0 || !fs::exists(audio)) {
-            throw std::runtime_error("ffmpeg 실패 (exit code " + std::to_string(rc) + ")");
+            throw std::runtime_error("ffmpeg 실패 (exit code " + std::to_string(rc) + "). 로그: " + log);
         }
     }
 

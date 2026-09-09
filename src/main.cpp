@@ -10,6 +10,7 @@
 
 #include "audio.h"
 #include "db.h"
+#include "paths.h"
 #include "transcript.h"
 #include "youtube.h"
 
@@ -165,10 +166,10 @@ int main(int argc, char** argv) {
     }
 
     try {
+        paths::setup();
         App app;
         app.videoId = *id;
-        app.dir = "data/" + *id;
-        fs::create_directories("data");
+        app.dir = paths::dataDir() + "\\" + *id;
 
         auto dl = yt::download(*id, app.dir);
         app.title = dl.title.empty() ? *id : dl.title;
@@ -189,8 +190,8 @@ int main(int argc, char** argv) {
 
         Db db;
         std::string err;
-        if (!db.open("data/youshadow.db", &err)) throw std::runtime_error(err);
-        db.importTsv("data/practice.tsv");
+        if (!db.open(paths::dataDir() + "\\youshadow.db", &err)) throw std::runtime_error(err);
+        db.importTsv(paths::dataDir() + "\\practice.tsv");
         db.upsertVideo(app.videoId, app.title, AudioEngine::durationMs(app.pcm));
         db.upsertSegments(app.videoId, app.segs);
         app.db = &db;

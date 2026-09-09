@@ -9,6 +9,7 @@
 #endif
 
 #include "audio.h"
+#include "paths.h"
 #include "scoring.h"
 #include "stt.h"
 #include "transcript.h"
@@ -21,9 +22,10 @@ int main(int argc, char** argv) {
         std::cout << "usage: stt_test <video_id> <seg_idx>\n";
         return 1;
     }
+    paths::setup();
     const std::string id = argv[1];
     const int idx = std::stoi(argv[2]);
-    const std::string dir = "data/" + id;
+    const std::string dir = paths::dataDir() + "\\" + id;
 
     auto segs = transcript::load(dir + "/segments.json");
     if (idx < 0 || idx >= (int)segs.size()) { std::cout << "bad seg idx\n"; return 1; }

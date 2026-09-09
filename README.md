@@ -32,7 +32,21 @@
   - 복습 세션: [복습 시작] 한 번으로 복습할 문장을 순서대로 열어 준다
 - **파형 표시**: 원본 문장과 내 녹음의 파형을 나란히 표시
 
-## 빌드
+## 다운로드 (사용자용)
+
+[Releases](https://github.com/JuZeroKR/YouShadow/releases) 에서 받습니다. Windows 10/11 64bit.
+
+| 파일 | 설명 |
+|---|---|
+| `YouShadow-Setup-v*.exe` | 설치 프로그램. 관리자 권한 없이 사용자 폴더에 설치되고 시작 메뉴에 등록됩니다 |
+| `YouShadow-v*-win64.zip` | 포터블. 압축을 풀고 `YouShadow.exe` 를 실행합니다 |
+
+- yt-dlp, ffmpeg, deno 가 동봉되어 있어 따로 설치할 것이 없습니다.
+- 발음 채점과 자막 없는 영상의 대본 생성에 쓰는 whisper 모델(148MB)은 앱 상단의 [STT 모델 받기] 버튼으로 받습니다.
+- 학습 데이터는 `%LOCALAPPDATA%\YouShadow` 에 저장되며, 프로그램을 제거해도 남습니다.
+- 코드 서명이 없어서 처음 실행할 때 Windows SmartScreen 경고가 뜰 수 있습니다. [추가 정보] → [실행] 으로 진행하세요.
+
+## 빌드 (개발자용)
 
 요구 사항: Windows 10/11, Visual Studio 2022 (MSVC), CMake 3.20+, git
 
@@ -59,6 +73,14 @@ winget install yt-dlp.yt-dlp     # yt-dlp + ffmpeg 가 PATH 에 들어간다
 | [SQLite](https://www.sqlite.org/) | 학습 기록 |
 | [nlohmann/json](https://github.com/nlohmann/json) | 자막 파싱 |
 
+### 배포 패키지 만들기
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\package.ps1
+```
+
+`dist\` 에 포터블 zip 과 Inno Setup 설치 프로그램이 만들어집니다 (yt-dlp, ffmpeg, deno 를 내려받아 동봉). `v*` 태그를 push 하면 GitHub Actions 가 같은 작업을 해서 Release 에 올립니다.
+
 ## 실행
 
 ```
@@ -67,6 +89,8 @@ run-gui.cmd https://www.youtube.com/watch?v=VIDEO_ID
 ```
 
 실행하면 홈 화면이 뜹니다. 상단 입력창에 URL 을 넣고 [불러오기]를 누르면 다운로드 후 학습 화면으로 넘어갑니다. 처음 한 번만 받고 그 뒤로는 캐시를 씁니다.
+
+저장소 루트에서 실행하면(개발 모드) `data/`, `models/` 를 쓰고, 설치판이나 포터블은 `%LOCALAPPDATA%\YouShadow` 를 씁니다. 외부 도구 출력은 그 아래 `logs\tools.log` 에 남습니다.
 
 ### 단축키
 
@@ -93,7 +117,7 @@ data/
 models/ggml-base.en.bin      whisper 모델 (148MB)
 ```
 
-`data/`, `models/`, `third_party/`, `build/` 는 저장소에 올라가지 않습니다.
+`data/`, `models/`, `third_party/`, `build/`, `dist/` 는 저장소에 올라가지 않습니다.
 
 ## 구조
 
@@ -107,9 +131,13 @@ src/
   scoring.cpp     원문 vs 인식 결과 편집 거리 정렬, 정확도
   audio.cpp       miniaudio 녹음/재생, 파형 피크, 리샘플
   db.cpp          SQLite 저장소, 간격 반복, 통계
+  paths.cpp       데이터/모델 경로, 동봉 도구 PATH, 숨김 프로세스 실행
   main.cpp        CLI 버전 (초기 프로토타입)
   stt_test.cpp    STT + 채점 검증 도구
 scripts/setup-deps.ps1   의존성 설치
+scripts/package.ps1      배포 패키지 (zip + 설치 프로그램)
+installer/youshadow.iss  Inno Setup 스크립트
+.github/workflows/release.yml  태그 push 시 자동 빌드 · Release
 ```
 
 테스트용으로 `youshadow-gui.exe --script cmds.txt` 를 주면 `load <id>` / `wait <초>` / `play <n>` / `echo <n>` / `record` / `home` / `review` / `rate hard|good|easy` / `quit` 명령을 순서대로 실행합니다. 시연 GIF 도 이 방식으로 찍었습니다.

@@ -12,3 +12,6 @@ models/
 
 # 외부 라이브러리 — scripts/setup-deps.ps1 로 받는다
 third_party/
+
+# 배포 패키지 — scripts/package.ps1 결과물
+dist/

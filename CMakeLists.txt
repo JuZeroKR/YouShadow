@@ -1,14 +1,19 @@
 cmake_minimum_required(VERSION 3.20)
-project(YouShadow LANGUAGES C CXX)
+project(YouShadow VERSION 0.1.0 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
+
+# 배포판이 VC 런타임 없이 동작하도록 CRT 를 정적으로 링크한다 (하위 프로젝트 포함)
+set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 
 set(TP ${CMAKE_SOURCE_DIR}/third_party)
 
 # ---- 공통 옵션 ----
 add_library(ys_options INTERFACE)
-target_compile_definitions(ys_options INTERFACE _CRT_SECURE_NO_WARNINGS NOMINMAX WIN32_LEAN_AND_MEAN)
+target_compile_definitions(ys_options INTERFACE
+    _CRT_SECURE_NO_WARNINGS NOMINMAX WIN32_LEAN_AND_MEAN
+    YS_VERSION="${PROJECT_VERSION}")
 if(MSVC)
     target_compile_options(ys_options INTERFACE /utf-8 /W3)
 endif()
@@ -31,6 +36,7 @@ endif()
 
 # ---- 핵심 로직 (CLI/GUI 공용) ----
 add_library(ys_core STATIC
+    src/paths.cpp
     src/youtube.cpp
     src/transcript.cpp
     src/audio.cpp
@@ -62,18 +68,20 @@ target_link_libraries(youshadow-cli PRIVATE ys_core)
 add_executable(stt_test src/stt_test.cpp)
 target_link_libraries(stt_test PRIVATE ys_core)
 
-# ---- GUI ----
-add_executable(youshadow-gui
+# ---- GUI (콘솔 창 없는 Windows 앱, 진입점은 main) ----
+add_executable(youshadow-gui WIN32
     src/gui_main.cpp
     src/player.cpp
+    assets/youshadow.rc
 )
 target_include_directories(youshadow-gui PRIVATE ${TP}/mpv/include)
 target_link_libraries(youshadow-gui PRIVATE
     ys_core imgui
-    ${TP}/glfw/lib-vc2022/glfw3.lib
+    ${TP}/glfw/lib-vc2022/glfw3_mt.lib
     ${TP}/mpv/libmpv.lib
     opengl32
 )
+target_link_options(youshadow-gui PRIVATE /ENTRY:mainCRTStartup)
 add_custom_command(TARGET youshadow-gui POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
             ${TP}/mpv/libmpv-2.dll $<TARGET_FILE_DIR:youshadow-gui>

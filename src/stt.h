@@ -13,7 +13,7 @@ class Stt {
 public:
     static constexpr int kRate = 16000;
 
-    static std::string defaultModelPath();  // models/ggml-base.en.bin
+    static std::string defaultModelPath();  // <modelsDir>/ggml-base.en.bin
     static std::string modelUrl();
 
     Stt() = default;
