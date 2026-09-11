@@ -31,7 +31,7 @@ void progressThunk(whisper_context*, whisper_state*, int progress, void* user) {
 
 }  // namespace
 
-std::string Stt::defaultModelPath() { return paths::modelsDir() + "\\ggml-base.en.bin"; }
+std::string Stt::defaultModelPath() { return paths::modelsDir() + "/ggml-base.en.bin"; }
 std::string Stt::modelUrl() {
     return "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.en.bin";
 }

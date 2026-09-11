@@ -25,7 +25,7 @@ int main(int argc, char** argv) {
     paths::setup();
     const std::string id = argv[1];
     const int idx = std::stoi(argv[2]);
-    const std::string dir = paths::dataDir() + "\\" + id;
+    const std::string dir = paths::dataDir() + "/" + id;
 
     auto segs = transcript::load(dir + "/segments.json");
     if (idx < 0 || idx >= (int)segs.size()) { std::cout << "bad seg idx\n"; return 1; }

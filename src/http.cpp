@@ -1,5 +1,7 @@
 #include "http.h"
 
+#ifdef _WIN32
+
 #include <windows.h>
 #include <winhttp.h>
 
@@ -77,3 +79,65 @@ HttpResponse httpRequest(const std::string& method, const std::string& url,
     }
     return res;
 }
+
+#else  // POSIX: 시스템 libcurl
+
+#include <curl/curl.h>
+
+#include <mutex>
+
+namespace {
+
+size_t writeBody(char* ptr, size_t size, size_t nmemb, void* userdata) {
+    static_cast<std::string*>(userdata)->append(ptr, size * nmemb);
+    return size * nmemb;
+}
+
+}  // namespace
+
+HttpResponse httpRequest(const std::string& method, const std::string& url,
+                         const std::vector<std::pair<std::string, std::string>>& headers,
+                         const std::string& body, std::string* err, int timeoutSec) {
+    static std::once_flag once;
+    std::call_once(once, [] { curl_global_init(CURL_GLOBAL_DEFAULT); });
+
+    HttpResponse res;
+    CURL* curl = curl_easy_init();
+    if (!curl) {
+        if (err) *err = "curl 초기화 실패";
+        return res;
+    }
+
+    curl_slist* hdrs = nullptr;
+    for (const auto& [k, v] : headers) hdrs = curl_slist_append(hdrs, (k + ": " + v).c_str());
+
+    curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
+    curl_easy_setopt(curl, CURLOPT_CUSTOMREQUEST, method.c_str());
+    if (!body.empty()) {
+        curl_easy_setopt(curl, CURLOPT_POSTFIELDS, body.data());
+        curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, (long)body.size());
+    }
+    if (hdrs) curl_easy_setopt(curl, CURLOPT_HTTPHEADER, hdrs);
+    curl_easy_setopt(curl, CURLOPT_USERAGENT, "YouShadow/1.0");
+    curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 15L);
+    curl_easy_setopt(curl, CURLOPT_TIMEOUT, (long)timeoutSec);
+    curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
+    curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
+    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, writeBody);
+    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &res.body);
+
+    CURLcode rc = curl_easy_perform(curl);
+    if (rc != CURLE_OK) {
+        if (err) *err = std::string("요청 실패: ") + curl_easy_strerror(rc) + " (인터넷 연결 확인)";
+        res.body.clear();
+    } else {
+        long status = 0;
+        curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &status);
+        res.status = (int)status;
+    }
+    curl_slist_free_all(hdrs);
+    curl_easy_cleanup(curl);
+    return res;
+}
+
+#endif

@@ -1,7 +1,14 @@
 #include "player.h"
 
+#ifdef _WIN32
 #include <windows.h>
 #include <GL/gl.h>
+#else
+#include <OpenGL/gl.h>
+#ifndef APIENTRY
+#define APIENTRY
+#endif
+#endif
 
 #include <cstdio>
 #include <mpv/client.h>

@@ -1,3 +1,6 @@
+// Windows SAPI 구현. macOS 구현은 tts_mac.mm 에 있다.
+#ifdef _WIN32
+
 #include "tts.h"
 
 #include <windows.h>
@@ -87,3 +90,5 @@ void Tts::stop() {
 void Tts::setVolume(int percent) {
     if (voice_) voice_->SetVolume((USHORT)std::clamp(percent, 0, 100));
 }
+
+#endif  // _WIN32

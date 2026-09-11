@@ -2,7 +2,8 @@
 #include <string>
 
 // 실행 환경에 따른 경로. 저장소에서 개발 중이면(현재 폴더에 CMakeLists.txt) ./data, ./models 를 쓰고,
-// 설치/포터블 실행이면 %LOCALAPPDATA%\YouShadow 아래를 쓴다.
+// 설치/포터블 실행이면 Windows 는 %LOCALAPPDATA%\YouShadow, macOS 는
+// ~/Library/Application Support/YouShadow 아래를 쓴다.
 namespace paths {
 
 std::string exeDir();

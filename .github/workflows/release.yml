@@ -1,4 +1,4 @@
-# v* 태그를 push 하면 Windows 에서 빌드해 포터블 zip 과 설치 프로그램을 GitHub Release 에 올린다.
+# v* 태그를 push 하면 Windows 와 macOS 에서 빌드해 패키지를 GitHub Release 에 올린다.
 name: release
 
 on:
@@ -10,7 +10,7 @@ permissions:
   contents: write
 
 jobs:
-  build:
+  build-windows:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
@@ -44,8 +44,38 @@ jobs:
           $tag = "${{ github.ref_name }}"
           $files = Get-ChildItem dist/*.zip, dist/*.exe | ForEach-Object { $_.FullName }
           gh release view $tag 2>$null
-          if ($LASTEXITCODE -eq 0) {
-            gh release upload $tag $files --clobber
-          } else {
-            gh release create $tag $files --title "YouShadow $tag" --generate-notes
+          if ($LASTEXITCODE -ne 0) {
+            gh release create $tag --title "YouShadow $tag" --generate-notes
+            if ($LASTEXITCODE -ne 0) { Start-Sleep 5 }  # 다른 잡이 동시에 만들었으면 업로드만 한다
           }
+          gh release upload $tag $files --clobber
+
+  build-mac:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 의존성 받기
+        run: |
+          brew install dylibbundler pkgconf
+          bash scripts/setup-deps.sh --no-model
+
+      - name: 빌드 + 패키징
+        run: bash scripts/package.sh
+
+      - name: 아티팩트 업로드
+        uses: actions/upload-artifact@v4
+        with:
+          name: youshadow-macos
+          path: dist/*.zip
+
+      - name: Release 생성
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="${{ github.ref_name }}"
+          if ! gh release view "$tag" >/dev/null 2>&1; then
+            gh release create "$tag" --title "YouShadow $tag" --generate-notes || sleep 5  # 다른 잡이 동시에 만들었으면 업로드만 한다
+          fi
+          gh release upload "$tag" dist/*.zip --clobber

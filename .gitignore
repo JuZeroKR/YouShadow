@@ -6,6 +6,7 @@ out/
 
 # 학습 데이터 (영상, 자막, 녹음, SQLite) — 절대 올리지 않는다
 data/
+logs/
 
 # whisper 모델 (148MB)
 models/

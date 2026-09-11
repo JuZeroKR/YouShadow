@@ -46,7 +46,7 @@ static std::string readTitle(const std::string& dir) {
     return title;
 }
 
-std::string logPath() { return paths::logDir() + "\\tools.log"; }
+std::string logPath() { return paths::logDir() + "/tools.log"; }
 
 DownloadResult download(const std::string& videoId, const std::string& dir) {
     fs::create_directories(dir);

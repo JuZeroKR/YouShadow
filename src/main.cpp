@@ -169,7 +169,7 @@ int main(int argc, char** argv) {
         paths::setup();
         App app;
         app.videoId = *id;
-        app.dir = paths::dataDir() + "\\" + *id;
+        app.dir = paths::dataDir() + "/" + *id;
 
         auto dl = yt::download(*id, app.dir);
         app.title = dl.title.empty() ? *id : dl.title;
@@ -190,8 +190,8 @@ int main(int argc, char** argv) {
 
         Db db;
         std::string err;
-        if (!db.open(paths::dataDir() + "\\youshadow.db", &err)) throw std::runtime_error(err);
-        db.importTsv(paths::dataDir() + "\\practice.tsv");
+        if (!db.open(paths::dataDir() + "/youshadow.db", &err)) throw std::runtime_error(err);
+        db.importTsv(paths::dataDir() + "/practice.tsv");
         db.upsertVideo(app.videoId, app.title, AudioEngine::durationMs(app.pcm));
         db.upsertSegments(app.videoId, app.segs);
         app.db = &db;

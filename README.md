@@ -1,6 +1,6 @@
 # YouShadow
 
-유튜브 영상으로 영어 쉐도잉을 연습하는 Windows 데스크톱 앱 (C++).
+유튜브 영상으로 영어 쉐도잉을 연습하는 데스크톱 앱 (C++, Windows / macOS).
 
 링크 하나만 넣으면 영상과 영어 자막을 받아 문장 단위로 나눠 주고, 문장별로 반복 재생 · 쉐도잉 · 따라말하기 녹음을 한 뒤 whisper 음성 인식으로 발음을 채점합니다. 연습 기록은 SQLite에 쌓이고, 간격 반복 방식으로 복습할 문장을 골라 줍니다.
 
@@ -25,6 +25,10 @@
   - 녹음만: 원본 듣기 없이 바로 녹음 (같은 문장 반복 연습)
   - 무음 감지 자동 종료 (배경 소음을 재서 감도 자동 조절), Space 로 수동 종료
 - **채점**: 내 녹음을 whisper 로 텍스트화해서 원문과 단어 단위로 정렬. 정확도 % 와 맞음 / 빠짐 / 다르게 들림 / 추가로 들림 표시. 추임새("uh", "um")와 효과음 표기는 제외
+- **문장 학습** ([학습] 탭)
+  - 리스닝: 자막을 숨긴 채 문장을 듣고 받아쓰기. 대소문자 · 문장 부호는 무시하고 단어 단위로 채점
+  - 영작: AI 해설의 한국어 번역만 보고 영어로 써 보기 (번역이 없으면 그 자리에서 생성)
+  - 문제 진행 중에는 자막 · 문장 목록 · 단어 발음 · 해설에서 정답이 숨겨지고, 채점 결과는 연습 기록과 통계에 반영
 - **AI 표현 해설** (Claude / ChatGPT / Gemini 중 선택, 본인 API 키 사용)
   - 문장마다 한국어 번역, 배울 만한 표현(뜻 · 뉘앙스 · 예문), 문법 포인트를 생성. 앞뒤 문장을 문맥으로 함께 보냄
   - 한 문장씩 또는 영상 전체를 한 번에 생성하고 DB 에 캐시
@@ -41,19 +45,22 @@
 
 ## 다운로드 (사용자용)
 
-[Releases](https://github.com/JuZeroKR/YouShadow/releases) 에서 받습니다. Windows 10/11 64bit.
+[Releases](https://github.com/JuZeroKR/YouShadow/releases) 에서 받습니다.
 
 | 파일 | 설명 |
 |---|---|
-| `YouShadow-Setup-v*.exe` | 설치 프로그램. 관리자 권한 없이 사용자 폴더에 설치되고 시작 메뉴에 등록됩니다 |
-| `YouShadow-v*-win64.zip` | 포터블. 압축을 풀고 `YouShadow.exe` 를 실행합니다 |
+| `YouShadow-Setup-v*.exe` | Windows 10/11 64bit 설치 프로그램. 관리자 권한 없이 사용자 폴더에 설치되고 시작 메뉴에 등록됩니다 |
+| `YouShadow-v*-win64.zip` | Windows 포터블. 압축을 풀고 `YouShadow.exe` 를 실행합니다 |
+| `YouShadow-v*-macos-arm64.zip` | macOS 12+ (Apple Silicon). 압축을 풀고 `YouShadow.app` 을 응용 프로그램 폴더로 옮겨 실행합니다 |
 
 - yt-dlp, ffmpeg, deno 가 동봉되어 있어 따로 설치할 것이 없습니다.
 - 발음 채점과 자막 없는 영상의 대본 생성에 쓰는 whisper 모델(148MB)은 앱 상단의 [STT 모델 받기] 버튼으로 받습니다.
-- 학습 데이터는 `%LOCALAPPDATA%\YouShadow` 에 저장되며, 프로그램을 제거해도 남습니다.
-- 코드 서명이 없어서 처음 실행할 때 Windows SmartScreen 경고가 뜰 수 있습니다. [추가 정보] → [실행] 으로 진행하세요.
+- 학습 데이터는 Windows 는 `%LOCALAPPDATA%\YouShadow`, macOS 는 `~/Library/Application Support/YouShadow` 에 저장되며, 프로그램을 제거해도 남습니다.
+- 코드 서명이 없어서 처음 실행할 때 경고가 뜰 수 있습니다. Windows 는 SmartScreen 에서 [추가 정보] → [실행], macOS 는 우클릭 → [열기] 로 진행하세요 (막히면 `xattr -dr com.apple.quarantine /Applications/YouShadow.app`).
 
 ## 빌드 (개발자용)
+
+### Windows
 
 요구 사항: Windows 10/11, Visual Studio 2022 이상 (MSVC), CMake 3.20+, git
 
@@ -69,7 +76,27 @@ cmake --build build --config Release
 winget install yt-dlp.yt-dlp     # yt-dlp + ffmpeg 가 PATH 에 들어간다
 ```
 
-`scripts/setup-deps.ps1` 이 받는 것:
+### macOS
+
+요구 사항: macOS 12+, Xcode Command Line Tools, CMake 3.20+, git, [Homebrew](https://brew.sh)
+
+```bash
+# 1. 의존성 받기 (third_party/ 와 models/ 에 설치 + brew 로 glfw, mpv, yt-dlp, ffmpeg)
+bash scripts/setup-deps.sh
+
+# 2. 빌드
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build -j
+
+# 3. 실행 (저장소 루트에서)
+./build/youshadow-gui
+```
+
+플랫폼별 구현: HTTPS 는 WinHTTP ↔ 시스템 libcurl, API 키 암호화는 DPAPI ↔ Keychain(마스터 키) + AES-256, 단어 발음은 SAPI ↔ AVSpeechSynthesizer, 데이터 경로는 `%LOCALAPPDATA%\YouShadow` ↔ `~/Library/Application Support/YouShadow`. 첫 녹음 때 마이크 권한을 요청합니다.
+
+### 공통 의존성
+
+`scripts/setup-deps.ps1` (Windows) / `scripts/setup-deps.sh` (macOS) 가 받는 것:
 
 | 라이브러리 | 용도 |
 |---|---|
@@ -83,21 +110,28 @@ winget install yt-dlp.yt-dlp     # yt-dlp + ffmpeg 가 PATH 에 들어간다
 ### 배포 패키지 만들기
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File scripts\package.ps1
+powershell -ExecutionPolicy Bypass -File scripts\package.ps1   # Windows
+```
+```bash
+brew install dylibbundler
+bash scripts/package.sh                                        # macOS
 ```
 
-`dist\` 에 포터블 zip 과 Inno Setup 설치 프로그램이 만들어집니다 (yt-dlp, ffmpeg, deno 를 내려받아 동봉). `v*` 태그를 push 하면 GitHub Actions 가 같은 작업을 해서 Release 에 올립니다.
+`dist/` 에 만들어집니다 — Windows 는 포터블 zip 과 Inno Setup 설치 프로그램, macOS 는 `YouShadow.app` 과 zip (libmpv 등 의존 dylib 을 앱에 동봉하고 ad-hoc 서명). 둘 다 yt-dlp, ffmpeg, deno 를 내려받아 동봉합니다. `v*` 태그를 push 하면 GitHub Actions 가 두 플랫폼 모두 빌드해서 Release 에 올립니다.
 
 ## 실행
 
 ```
-run-gui.cmd
+run-gui.cmd                                              # Windows
 run-gui.cmd https://www.youtube.com/watch?v=VIDEO_ID
+
+./build/youshadow-gui                                    # macOS
+./build/youshadow-gui https://www.youtube.com/watch?v=VIDEO_ID
 ```
 
 실행하면 홈 화면이 뜹니다. 상단 입력창에 URL 을 넣고 [불러오기]를 누르면 다운로드 후 학습 화면으로 넘어갑니다. 처음 한 번만 받고 그 뒤로는 캐시를 씁니다.
 
-저장소 루트에서 실행하면(개발 모드) `data/`, `models/` 를 쓰고, 설치판이나 포터블은 `%LOCALAPPDATA%\YouShadow` 를 씁니다. 외부 도구 출력은 그 아래 `logs\tools.log` 에 남습니다.
+저장소 루트에서 실행하면(개발 모드) `data/`, `models/` 를 쓰고, 그 외에는 Windows 는 `%LOCALAPPDATA%\YouShadow`, macOS 는 `~/Library/Application Support/YouShadow` 를 씁니다. 외부 도구 출력은 그 아래 `logs/tools.log` 에 남습니다.
 
 ### 단축키
 

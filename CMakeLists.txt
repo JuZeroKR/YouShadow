@@ -1,19 +1,30 @@
 cmake_minimum_required(VERSION 3.20)
-project(YouShadow VERSION 0.3.0 LANGUAGES C CXX)
+project(YouShadow VERSION 0.4.0 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
+if(APPLE)
+    enable_language(OBJCXX)  # tts_mac.mm (AVSpeechSynthesizer)
+endif()
+
 # 배포판이 VC 런타임 없이 동작하도록 CRT 를 정적으로 링크한다 (하위 프로젝트 포함)
-set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+if(MSVC)
+    set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+endif()
 
 set(TP ${CMAKE_SOURCE_DIR}/third_party)
 
 # ---- 공통 옵션 ----
 add_library(ys_options INTERFACE)
-target_compile_definitions(ys_options INTERFACE
-    _CRT_SECURE_NO_WARNINGS NOMINMAX WIN32_LEAN_AND_MEAN
-    YS_VERSION="${PROJECT_VERSION}")
+target_compile_definitions(ys_options INTERFACE YS_VERSION="${PROJECT_VERSION}")
+if(WIN32)
+    target_compile_definitions(ys_options INTERFACE
+        _CRT_SECURE_NO_WARNINGS NOMINMAX WIN32_LEAN_AND_MEAN)
+endif()
+if(APPLE)
+    target_compile_definitions(ys_options INTERFACE GL_SILENCE_DEPRECATION)
+endif()
 if(MSVC)
     target_compile_options(ys_options INTERFACE /utf-8 /W3)
 endif()
@@ -24,6 +35,10 @@ set(WHISPER_BUILD_TESTS OFF CACHE BOOL "" FORCE)
 set(WHISPER_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
 set(WHISPER_BUILD_SERVER OFF CACHE BOOL "" FORCE)
 set(GGML_OPENMP OFF CACHE BOOL "" FORCE)
+if(APPLE)
+    # Windows 와 같은 CPU 경로를 쓴다 (base.en 모델은 CPU 로 충분)
+    set(GGML_METAL OFF CACHE BOOL "" FORCE)
+endif()
 add_subdirectory(${TP}/whisper.cpp EXCLUDE_FROM_ALL)
 
 # ---- SQLite ----
@@ -48,8 +63,24 @@ add_library(ys_core STATIC
     src/llm.cpp
     src/tts.cpp
 )
+if(APPLE)
+    target_sources(ys_core PRIVATE src/tts_mac.mm)
+endif()
 target_include_directories(ys_core PUBLIC ${TP} src)
-target_link_libraries(ys_core PUBLIC ys_options sqlite3 whisper winhttp crypt32 ole32)
+target_link_libraries(ys_core PUBLIC ys_options sqlite3 whisper)
+if(WIN32)
+    target_link_libraries(ys_core PUBLIC winhttp crypt32 ole32)
+elseif(APPLE)
+    target_link_libraries(ys_core PUBLIC
+        curl
+        "-framework Security"
+        "-framework CoreFoundation"
+        "-framework Foundation"
+        "-framework AVFoundation"
+        "-framework CoreAudio"
+        "-framework AudioToolbox"
+    )
+endif()
 
 # ---- Dear ImGui + GLFW 백엔드 ----
 set(IMGUI ${TP}/imgui)
@@ -61,8 +92,14 @@ add_library(imgui STATIC
     ${IMGUI}/backends/imgui_impl_glfw.cpp
     ${IMGUI}/backends/imgui_impl_opengl3.cpp
 )
-target_include_directories(imgui PUBLIC ${IMGUI} ${IMGUI}/backends ${TP}/glfw/include)
+target_include_directories(imgui PUBLIC ${IMGUI} ${IMGUI}/backends)
 target_link_libraries(imgui PUBLIC ys_options)
+if(WIN32)
+    target_include_directories(imgui PUBLIC ${TP}/glfw/include)
+else()
+    find_package(glfw3 3.3 REQUIRED)   # brew install glfw
+    target_link_libraries(imgui PUBLIC glfw)
+endif()
 
 # ---- CLI ----
 add_executable(youshadow-cli src/main.cpp)
@@ -76,21 +113,37 @@ target_link_libraries(stt_test PRIVATE ys_core)
 add_executable(llm_test src/llm_test.cpp)
 target_link_libraries(llm_test PRIVATE ys_core)
 
-# ---- GUI (콘솔 창 없는 Windows 앱, 진입점은 main) ----
-add_executable(youshadow-gui WIN32
-    src/gui_main.cpp
-    src/player.cpp
-    assets/youshadow.rc
-)
-target_include_directories(youshadow-gui PRIVATE ${TP}/mpv/include)
-target_link_libraries(youshadow-gui PRIVATE
-    ys_core imgui
-    ${TP}/glfw/lib-vc2022/glfw3_mt.lib
-    ${TP}/mpv/libmpv.lib
-    opengl32
-)
-target_link_options(youshadow-gui PRIVATE /ENTRY:mainCRTStartup)
-add_custom_command(TARGET youshadow-gui POST_BUILD
-    COMMAND ${CMAKE_COMMAND} -E copy_if_different
-            ${TP}/mpv/libmpv-2.dll $<TARGET_FILE_DIR:youshadow-gui>
-)
+# ---- GUI ----
+if(WIN32)
+    # 콘솔 창 없는 Windows 앱, 진입점은 main
+    add_executable(youshadow-gui WIN32
+        src/gui_main.cpp
+        src/player.cpp
+        assets/youshadow.rc
+    )
+    target_include_directories(youshadow-gui PRIVATE ${TP}/mpv/include)
+    target_link_libraries(youshadow-gui PRIVATE
+        ys_core imgui
+        ${TP}/glfw/lib-vc2022/glfw3_mt.lib
+        ${TP}/mpv/libmpv.lib
+        opengl32
+    )
+    target_link_options(youshadow-gui PRIVATE /ENTRY:mainCRTStartup)
+    add_custom_command(TARGET youshadow-gui POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                ${TP}/mpv/libmpv-2.dll $<TARGET_FILE_DIR:youshadow-gui>
+    )
+else()
+    # macOS: libmpv 는 Homebrew (brew install mpv)
+    find_package(PkgConfig REQUIRED)
+    pkg_check_modules(MPV REQUIRED IMPORTED_TARGET mpv)
+    add_executable(youshadow-gui
+        src/gui_main.cpp
+        src/player.cpp
+    )
+    target_link_libraries(youshadow-gui PRIVATE
+        ys_core imgui
+        PkgConfig::MPV
+        "-framework OpenGL"
+    )
+endif()

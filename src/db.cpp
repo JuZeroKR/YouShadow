@@ -139,8 +139,10 @@ long long Db::addPractice(const PracticeRow& row) {
     st.bind(1, row.videoId).bind(2, row.segIdx).bind(3, row.mode).bind(4, row.at).bind(5, row.recordingPath);
     if (row.score >= 0) st.bind(6, row.score);
     st.run();
+    // ensureState 의 INSERT 가 last_insert_rowid 를 덮어쓰므로 먼저 읽어 둔다
+    long long id = sqlite3_last_insert_rowid(db_);
     ensureState(row.videoId, row.segIdx);
-    return sqlite3_last_insert_rowid(db_);
+    return id;
 }
 
 void Db::setPracticeScore(long long id, double score) {

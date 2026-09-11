@@ -1,6 +1,13 @@
 // YouShadow GUI: 영상(libmpv) + 문장 목록 + 쉐도잉/따라말하기 녹음 + 채점 + 복습 (Dear ImGui)
 
+#ifdef _WIN32
 #include <windows.h>
+#else
+#include <CoreFoundation/CoreFoundation.h>
+#include <csignal>
+#include <fcntl.h>
+#include <unistd.h>
+#endif
 
 #include <GLFW/glfw3.h>
 #include <imgui.h>
@@ -77,7 +84,7 @@ struct Loader {
             std::string err;
             try {
                 v.id = id;
-                v.dir = paths::dataDir() + "\\" + id;
+                v.dir = paths::dataDir() + "/" + id;
                 auto dl = yt::download(id, v.dir);
                 v.title = dl.title.empty() ? id : dl.title;
                 v.videoPath = fs::absolute(dl.videoPath).string();
@@ -194,7 +201,7 @@ struct ScoreJob {
 // ---------------- 앱 상태 ----------------
 
 enum class Mode { Idle, Segment, Shadow, ShadowTail, EchoListen, EchoRecord, EchoCompareOrig, EchoCompareMine, Record, MyRec };
-enum class Tab { None, Sentences, Review, Bookmarks, History, Explain, Cards };
+enum class Tab { None, Sentences, Quiz, Review, Bookmarks, History, Explain, Cards };
 
 const char* modeLabel(Mode m) {
     switch (m) {
@@ -329,6 +336,14 @@ struct App {
     std::vector<ExpressionCard> cards;
     bool cardsDirty = true;
     bool cardRevealed = false;  // 복습 세션에서 표현 카드 뜻 보기
+
+    // ---- 문장 학습 (리스닝 받아쓰기 / 영작) ----
+    int quizKind = 0;            // 0: 리스닝(자막 없이 받아쓰기), 1: 영작(한국어 → 영어)
+    int quizSeg = -1;            // 출제 중인 문장 (-1: 없음)
+    bool quizRevealed = false;   // 정답 공개됨
+    bool quizChecked = false;    // 채점됨
+    char quizBuf[2048] = {};
+    ScoreResult quizScore;
 
     // ---- 음량 / 발음 ----
     Tts tts;
@@ -707,6 +722,45 @@ struct App {
         scrollToCurrent = true;
     }
 
+    // ---- 문장 학습 ----
+    // 문제 진행 중(정답 공개 전)에는 화면 곳곳의 원문 표시를 숨긴다
+    bool quizHidden() const { return valid(quizSeg) && quizSeg == current && !quizRevealed; }
+
+    void startQuiz(int i, int kind) {
+        if (!valid(i)) return;
+        quizKind = kind;
+        quizSeg = i;
+        quizRevealed = false;
+        quizChecked = false;
+        quizBuf[0] = '\0';
+        if (kind == 0) {
+            playSegment(i, 1);  // 리스닝: 자막 없이 듣는다
+        } else {
+            // 영작: 소리도 정답이라 재생하지 않는다
+            stopAll();
+            current = i;
+            scrollToCurrent = true;
+        }
+        forceTab = Tab::Quiz;
+    }
+
+    void endQuiz() {
+        quizSeg = -1;
+        quizRevealed = false;
+        quizChecked = false;
+        quizBuf[0] = '\0';
+    }
+
+    void checkQuiz() {
+        if (!valid(quizSeg)) return;
+        quizScore = scoreTranscript(seg(quizSeg).text, quizBuf);
+        quizChecked = true;
+        quizRevealed = true;
+        long long pid = log(quizSeg, quizKind == 0 ? "listen" : "compose");
+        db.setPracticeScore(pid, quizScore.accuracy);
+        refreshStats();
+    }
+
     void playMyRecording() {
         if (myRec.empty() || scoreSeg != current) {
             std::string path = valid(current) ? db.lastRecording(video.id, current) : "";
@@ -1016,8 +1070,8 @@ struct App {
                 }
             }
         }
-        // 자막 오버레이
-        if (valid(current)) {
+        // 자막 오버레이 (문장 학습 문제 중에는 정답이라 숨긴다)
+        if (valid(current) && !quizHidden()) {
             ImDrawList* dl = ImGui::GetWindowDrawList();
             const std::string& text = seg(current).text;
             float wrap = avail.x * 0.9f;
@@ -1061,7 +1115,8 @@ struct App {
             ImU32 labelCol = bookmarks.count(i) ? IM_COL32(255, 200, 80, 255) : ImGui::GetColorU32(ImGuiCol_TextDisabled);
             dl->AddText(font, fs, ImVec2(top.x + 4, top.y + 2), labelCol, label);
             ImU32 col = selected ? IM_COL32(255, 230, 100, 255) : ImGui::GetColorU32(ImGuiCol_Text);
-            dl->AddText(font, fs, ImVec2(top.x + 4, top.y + 2 + ImGui::GetTextLineHeight()), col, s.text.c_str(), nullptr, wrap);
+            const char* rowText = (i == quizSeg && valid(quizSeg) && !quizRevealed) ? "(학습 문제 진행 중 — 정답 공개 전까지 숨김)" : s.text.c_str();
+            dl->AddText(font, fs, ImVec2(top.x + 4, top.y + 2 + ImGui::GetTextLineHeight()), col, rowText, nullptr, wrap);
             ImGui::PopID();
         }
     }
@@ -1096,6 +1151,7 @@ struct App {
 
     // 현재 문장의 연습 이력
     void drawHistoryList() {
+        if (quizHidden()) { ImGui::TextDisabled("문장 학습 문제 진행 중에는 이 문장의 기록을 숨깁니다."); return; }
         if (!valid(current)) { ImGui::TextDisabled("문장을 선택하면 그 문장의 연습 기록이 나옵니다."); return; }
         if (historyDirty || historySeg != current) {
             history = db.practicesFor(video.id, current);
@@ -1118,7 +1174,8 @@ struct App {
                 ImGui::TableNextColumn();
                 ImGui::TextUnformatted(h.at.substr(0, 16).c_str());
                 ImGui::TableNextColumn();
-                const char* modeName = h.mode == "shadow" ? "쉐도잉" : h.mode == "echo" ? "따라말하기" : h.mode == "record" ? "녹음" : h.mode == "repeat" ? "반복" : "재생";
+                const char* modeName = h.mode == "shadow" ? "쉐도잉" : h.mode == "echo" ? "따라말하기" : h.mode == "record" ? "녹음"
+                                     : h.mode == "repeat" ? "반복" : h.mode == "listen" ? "리스닝" : h.mode == "compose" ? "영작" : "재생";
                 ImGui::TextUnformatted(modeName);
                 ImGui::TableNextColumn();
                 if (h.score >= 0) {
@@ -1143,7 +1200,95 @@ struct App {
     }
 
     // AI 해설 탭: 현재 문장의 번역, 표현, 문법
+    // 문장 학습 탭: 리스닝(자막 없이 받아쓰기) / 영작(한국어 번역 보고 영어로 쓰기)
+    void drawQuizTab() {
+        if (!loaded) { ImGui::TextDisabled("영상을 불러오면 문장 학습을 할 수 있습니다."); return; }
+
+        ImGui::TextDisabled("자막 없이 듣고 받아쓰거나, 한국어 번역만 보고 영어로 써 보세요. 대소문자와 문장 부호는 채점에서 무시합니다.");
+        ImGui::RadioButton("리스닝 (받아쓰기)", &quizKind, 0);
+        ImGui::SameLine();
+        ImGui::RadioButton("영작 (한국어 → 영어)", &quizKind, 1);
+        ImGui::Separator();
+
+        if (!valid(quizSeg)) {
+            int base = valid(current) ? current : 0;
+            char label[64];
+            snprintf(label, sizeof label, "[%d]번 문장으로 시작", base);
+            if (ImGui::Button(label)) startQuiz(base, quizKind);
+            ImGui::TextDisabled("[문장] 탭에서 문장을 고른 뒤 시작하세요. 시작하면 정답이 공개될 때까지 자막과 원문이 숨겨집니다.");
+            return;
+        }
+
+        const auto& s = seg(quizSeg);
+        ImGui::TextDisabled("[%d] %s  ·  %s", quizSeg, transcript::formatTime(s.startMs).c_str(), quizKind == 0 ? "리스닝" : "영작");
+
+        if (quizKind == 0) {
+            if (ImGui::Button("다시 듣기")) playSegment(quizSeg, 1);
+            ImGui::SameLine();
+            ImGui::TextDisabled("(속도는 아래 [속도] 슬라이더로 조절)");
+        } else {
+            bool explaining;
+            { std::lock_guard<std::mutex> lock(explainJob.m); explaining = explainJob.running; }
+            auto it = explanations.find(quizSeg);
+            if (it != explanations.end() && !it->second.translation.empty()) {
+                ImGui::TextColored(ImVec4(0.6f, 0.8f, 1.0f, 1.0f), "한국어:");
+                ImGui::TextWrapped("%s", it->second.translation.c_str());
+            } else if (explaining) {
+                ImGui::TextColored(ImVec4(1, 0.8f, 0.3f, 1), "이 문장의 번역(AI 해설)을 만드는 중...");
+            } else if (llm.ready()) {
+                ImGui::TextWrapped("이 문장의 한국어 번역이 아직 없습니다. AI 해설을 만들면 번역이 문제로 나옵니다.");
+                if (ImGui::Button("이 문장 해설 생성")) requestExplain({quizSeg});
+            } else {
+                ImGui::TextWrapped("영작 문제는 AI 해설의 한국어 번역을 씁니다. 상단 [AI 설정]에서 API 키를 넣으세요.");
+                if (ImGui::Button("AI 설정 열기")) showSettings = true;
+            }
+        }
+
+        ImGui::Spacing();
+        ImGui::TextDisabled(quizKind == 0 ? "들리는 대로 영어로 쓰세요:" : "영어로 옮겨 보세요:");
+        ImGui::InputTextMultiline("##quizinput", quizBuf, sizeof quizBuf,
+                                  ImVec2(-1, ImGui::GetTextLineHeight() * 4),
+                                  quizChecked ? ImGuiInputTextFlags_ReadOnly : 0);
+
+        if (!quizRevealed) {
+            ImGui::BeginDisabled(quizBuf[0] == '\0');
+            if (ImGui::Button("확인 (채점)")) checkQuiz();
+            ImGui::EndDisabled();
+            ImGui::SameLine();
+            if (ImGui::Button("정답 보기 (포기)")) quizRevealed = true;
+            ImGui::SameLine();
+            if (ImGui::Button("그만하기")) endQuiz();
+        } else {
+            ImGui::Separator();
+            ImGui::TextColored(ImVec4(0.6f, 0.8f, 1.0f, 1.0f), "정답:");
+            ImGui::SameLine();
+            if (tts.available() && ImGui::SmallButton("발음 듣기")) speak(s.text);
+            ImGui::SameLine();
+            if (ImGui::SmallButton("영상으로 듣기")) playSegment(quizSeg, 1);
+            ImGui::TextWrapped("%s", s.text.c_str());
+            ImGui::Spacing();
+            if (quizChecked) {
+                drawScoreMarks(quizScore);
+                ImGui::TextDisabled("초록: 맞음  빨강: 빠짐  주황: 다르게 씀(내가 쓴 단어)  회색: 추가로 쓴 단어");
+            } else {
+                ImGui::TextDisabled("채점 없이 정답을 봤습니다.");
+            }
+            ImGui::Spacing();
+            if (ImGui::Button("같은 문장 다시")) startQuiz(quizSeg, quizKind);
+            ImGui::SameLine();
+            ImGui::BeginDisabled(!valid(quizSeg + 1));
+            if (ImGui::Button("다음 문장")) startQuiz(quizSeg + 1, quizKind);
+            ImGui::EndDisabled();
+            ImGui::SameLine();
+            if (ImGui::Button("끝내기")) endQuiz();
+        }
+    }
+
     void drawExplainTab() {
+        if (quizHidden()) {
+            ImGui::TextDisabled("문장 학습 문제 진행 중에는 해설을 숨깁니다. [학습] 탭에서 정답을 확인한 뒤 보세요.");
+            return;
+        }
         bool running;
         int done, total;
         { std::lock_guard<std::mutex> lock(explainJob.m); running = explainJob.running; done = explainJob.done; total = (int)explainJob.queue.size(); }
@@ -1307,6 +1452,12 @@ struct App {
                 ImGui::EndChild();
                 ImGui::EndTabItem();
             }
+            if (ImGui::BeginTabItem("학습", nullptr, forceTab == Tab::Quiz ? ImGuiTabItemFlags_SetSelected : 0)) {
+                ImGui::BeginChild("quiz");
+                drawQuizTab();
+                ImGui::EndChild();
+                ImGui::EndTabItem();
+            }
             if (ImGui::BeginTabItem(reviewTab, nullptr, forceTab == Tab::Review ? ImGuiTabItemFlags_SetSelected : 0)) {
                 ImGui::BeginChild("review");
                 ImGui::TextDisabled("복습할 때가 된 문장. 클릭하면 이동합니다.");
@@ -1347,6 +1498,7 @@ struct App {
 
     // 현재 문장을 단어 버튼으로 펼친다. 클릭하면 그 단어의 발음이 나온다.
     void drawWordRow() {
+        if (quizHidden()) { ImGui::TextDisabled("발음: 문장 학습 문제 진행 중이라 단어를 숨깁니다"); return; }
         if (!valid(current)) { ImGui::TextDisabled("발음: 문장을 선택하면 단어를 클릭해 발음을 들을 수 있습니다"); return; }
         if (!tts.available()) { ImGui::TextDisabled("발음: 이 PC 에 음성 합성 엔진이 없어 단어 발음을 들려줄 수 없습니다"); return; }
         ImGui::TextDisabled("발음:");
@@ -1370,6 +1522,7 @@ struct App {
     }
 
     void drawScoreLine() {
+        if (quizHidden()) { ImGui::TextDisabled("문장 학습 문제 진행 중이라 채점 결과를 숨깁니다."); return; }
         if (scoring) { ImGui::TextColored(ImVec4(1, 0.8f, 0.3f, 1), "채점 중..."); return; }
         if (!haveScore || scoreSeg != current) {
             if (!stt.loaded()) ImGui::TextDisabled("STT 모델을 받으면 녹음을 자동으로 채점합니다.");
@@ -1377,6 +1530,12 @@ struct App {
             return;
         }
         const auto& r = lastScore;
+        drawScoreMarks(r);
+        ImGui::TextDisabled("초록: 맞음  빨강: 빠짐  주황: 다르게 들림(들린 단어)  회색: 추가로 들린 단어  |  들린 문장: %s", r.heard.c_str());
+    }
+
+    // 정확도 + 단어별 채점 표시 (발음 채점과 문장 학습에서 공용)
+    void drawScoreMarks(const ScoreResult& r) {
         ImVec4 col = r.accuracy >= 85 ? ImVec4(0.4f, 1, 0.5f, 1) : r.accuracy >= 60 ? ImVec4(1, 0.85f, 0.3f, 1) : ImVec4(1, 0.5f, 0.5f, 1);
         ImGui::TextColored(col, "정확도 %d%% (%d/%d)", (int)r.accuracy, r.matched, r.total);
         // 단어를 색으로 표시하되 패널 폭에 맞춰 직접 줄바꿈한다
@@ -1395,7 +1554,6 @@ struct App {
             if (ImGui::GetItemRectMax().x + spacing + w <= lineRight) ImGui::SameLine();
             ImGui::TextColored(c, "%s", label.c_str());
         }
-        ImGui::TextDisabled("초록: 맞음  빨강: 빠짐  주황: 다르게 들림(들린 단어)  회색: 추가로 들린 단어  |  들린 문장: %s", r.heard.c_str());
     }
 
     // ---------------- 홈 (라이브러리 + 통계) ----------------
@@ -1697,7 +1855,10 @@ struct App {
         else if (cmd == "explain_all") requestExplainAll();
         else if (cmd == "settings") showSettings = true;
         else if (cmd == "say") { std::string rest; std::getline(ss, rest); speak(arg + rest); fprintf(stderr, "[tts] voice=%s available=%d\n", tts.voiceName().c_str(), (int)tts.available()); }
-        else if (cmd == "tab") forceTab = arg == "explain" ? Tab::Explain : arg == "cards" ? Tab::Cards : arg == "review" ? Tab::Review : arg == "history" ? Tab::History : Tab::Sentences;
+        else if (cmd == "tab") forceTab = arg == "explain" ? Tab::Explain : arg == "cards" ? Tab::Cards : arg == "review" ? Tab::Review : arg == "history" ? Tab::History : arg == "quiz" ? Tab::Quiz : Tab::Sentences;
+        else if (cmd == "quiz") startQuiz(std::max(0, current), arg == "compose" ? 1 : 0);
+        else if (cmd == "quiz_answer") { std::string rest; std::getline(ss, rest); snprintf(quizBuf, sizeof quizBuf, "%s", (arg + rest).c_str()); checkQuiz(); }
+        else if (cmd == "quiz_reveal") quizRevealed = true;
         else if (cmd == "rescore" && valid(current) && stt.loaded()) {
             // 현재 문장의 마지막 녹음을 다시 채점 (마이크 없이 채점 화면 확인용)
             std::string path = db.lastRecording(video.id, current);
@@ -1814,17 +1975,55 @@ struct App {
 
 void glfwError(int code, const char* desc) { fprintf(stderr, "GLFW error %d: %s\n", code, desc); }
 
+// 초기화 실패 등 치명적 오류를 사용자에게 알린다
+void fatalBox(const std::string& msg) {
+#ifdef _WIN32
+    MessageBoxA(nullptr, msg.c_str(), "YouShadow", MB_ICONERROR);
+#else
+    fprintf(stderr, "YouShadow: %s\n", msg.c_str());
+    CFStringRef text = CFStringCreateWithCString(nullptr, msg.c_str(), kCFStringEncodingUTF8);
+    if (text) {
+        CFUserNotificationDisplayNotice(0, kCFUserNotificationStopAlertLevel, nullptr, nullptr, nullptr,
+                                        CFSTR("YouShadow"), text, CFSTR("확인"));
+        CFRelease(text);
+    }
+#endif
+}
+
+#ifdef _WIN32
 // 처리되지 않은 예외(크래시)를 logs\crash.log 에 남기고 안내창을 띄운다
 LONG WINAPI crashHandler(EXCEPTION_POINTERS* ep) {
     char buf[512];
     snprintf(buf, sizeof buf, "YouShadow v%s crashed: exception 0x%08lX at %p\r\n", YS_VERSION,
              ep && ep->ExceptionRecord ? ep->ExceptionRecord->ExceptionCode : 0,
              ep && ep->ExceptionRecord ? ep->ExceptionRecord->ExceptionAddress : nullptr);
-    std::string path = paths::logDir() + "\\crash.log";
+    std::string path = paths::logDir() + "/crash.log";
     if (FILE* f = fopen(path.c_str(), "ab")) { fputs(buf, f); fclose(f); }
     MessageBoxA(nullptr, (std::string("프로그램에 문제가 생겨 종료합니다.\n\n") + buf + "\n로그: " + path).c_str(), "YouShadow", MB_ICONERROR);
     return EXCEPTION_EXECUTE_HANDLER;
 }
+
+void installCrashHandler() { SetUnhandledExceptionFilter(crashHandler); }
+#else
+// 치명적 시그널을 logs/crash.log 에 남긴다 (시그널 핸들러라 async-safe 함수만 사용)
+char g_crashLogPath[1024];
+
+void crashSignal(int sig) {
+    char buf[160];
+    int n = snprintf(buf, sizeof buf, "YouShadow v%s crashed: signal %d\n", YS_VERSION, sig);
+    int fd = open(g_crashLogPath, O_WRONLY | O_CREAT | O_APPEND, 0644);
+    if (fd >= 0) {
+        (void)!write(fd, buf, (size_t)n);
+        close(fd);
+    }
+    _exit(128 + sig);
+}
+
+void installCrashHandler() {
+    snprintf(g_crashLogPath, sizeof g_crashLogPath, "%s/crash.log", paths::logDir().c_str());
+    for (int sig : {SIGSEGV, SIGABRT, SIGFPE, SIGILL, SIGBUS}) signal(sig, crashSignal);
+}
+#endif
 
 }  // namespace
 
@@ -1833,14 +2032,24 @@ LONG WINAPI crashHandler(EXCEPTION_POINTERS* ep) {
 #endif
 
 int main(int argc, char** argv) {
+#ifdef _WIN32
     SetConsoleOutputCP(CP_UTF8);
+#endif
     paths::setup();
-    SetUnhandledExceptionFilter(crashHandler);
+    installCrashHandler();
 
     glfwSetErrorCallback(glfwError);
     if (!glfwInit()) return 1;
+#ifdef __APPLE__
+    // macOS 는 3.2+ 코어 프로파일만 지원한다
+    glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 3);
+    glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 2);
+    glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_CORE_PROFILE);
+    glfwWindowHint(GLFW_OPENGL_FORWARD_COMPAT, GLFW_TRUE);
+#else
     glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 3);
     glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 0);
+#endif
     glfwWindowHint(GLFW_MAXIMIZED, GLFW_TRUE);
     glfwWindowHint(GLFW_SCALE_TO_MONITOR, GLFW_TRUE);
     GLFWwindow* window = glfwCreateWindow(1280, 800, "YouShadow v" YS_VERSION, nullptr, nullptr);
@@ -1856,26 +2065,39 @@ int main(int argc, char** argv) {
     ImGui::GetStyle().FrameRounding = 4.0f;
     float scaleX = 1.0f, scaleY = 1.0f;
     glfwGetWindowContentScale(window, &scaleX, &scaleY);
+#ifdef __APPLE__
+    // macOS 는 창 좌표가 이미 포인트 단위라 레티나 배율을 UI 크기에 더하지 않는다
+    const float uiScale = 1.0f;
+#else
     const float uiScale = std::max(1.0f, scaleX);
+#endif
     ImGui::GetStyle().ScaleAllSizes(uiScale);
+#ifdef _WIN32
     const char* fontPath = "C:/Windows/Fonts/malgun.ttf";
+#else
+    const char* fontPath = "/System/Library/Fonts/AppleSDGothicNeo.ttc";  // 한글 지원 기본 폰트
+#endif
     if (fs::exists(fontPath)) io.Fonts->AddFontFromFileTTF(fontPath, 18.0f * uiScale);
     ImGui_ImplGlfw_InitForOpenGL(window, true);
+#ifdef __APPLE__
+    ImGui_ImplOpenGL3_Init("#version 150");
+#else
     ImGui_ImplOpenGL3_Init("#version 130");
+#endif
 
     App app;
     app.uiScale = uiScale;
     app.window = window;
     std::string err;
     if (!app.mpv.init([](const char* n) { return (void*)glfwGetProcAddress(n); }, &err)) {
-        MessageBoxA(nullptr, ("영상 재생기(libmpv) 초기화 실패: " + err).c_str(), "YouShadow", MB_ICONERROR);
+        fatalBox("영상 재생기(libmpv) 초기화 실패: " + err);
         return 1;
     }
-    if (!app.db.open(paths::dataDir() + "\\youshadow.db", &err)) {
-        MessageBoxA(nullptr, err.c_str(), "YouShadow", MB_ICONERROR);
+    if (!app.db.open(paths::dataDir() + "/youshadow.db", &err)) {
+        fatalBox(err);
         return 1;
     }
-    app.db.importTsv(paths::dataDir() + "\\practice.tsv");
+    app.db.importTsv(paths::dataDir() + "/practice.tsv");
     app.loadSettings();
     app.tts.init();
     app.applyAudioSettings();

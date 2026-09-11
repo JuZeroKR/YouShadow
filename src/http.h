@@ -3,7 +3,7 @@
 #include <utility>
 #include <vector>
 
-// WinHTTP 기반의 작은 HTTPS 클라이언트 (외부 의존성 없음)
+// 작은 HTTPS 클라이언트 (Windows: WinHTTP, macOS: 시스템 libcurl — 외부 의존성 없음)
 struct HttpResponse {
     int status = 0;
     std::string body;

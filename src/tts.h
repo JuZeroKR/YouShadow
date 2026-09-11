@@ -1,7 +1,8 @@
 #pragma once
 #include <string>
 
-// Windows SAPI 음성 합성. 영어 음성을 골라 단어/문장 발음을 들려준다 (오프라인).
+// 시스템 음성 합성 (Windows: SAPI, macOS: AVSpeechSynthesizer).
+// 영어 음성을 골라 단어/문장 발음을 들려준다 (오프라인).
 class Tts {
 public:
     Tts() = default;
@@ -16,7 +17,11 @@ public:
     void setVolume(int percent);       // 0~100
 
 private:
+#ifdef _WIN32
     struct ISpVoice* voice_ = nullptr;
+#else
+    void* voice_ = nullptr;  // macOS: 내부 구현 (tts_mac.mm)
+#endif
     std::string voiceName_;
     bool comInit_ = false;
 };
