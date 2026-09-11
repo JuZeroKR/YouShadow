@@ -1,5 +1,7 @@
 # YouShadow
 
+**한국어** | [English](README.en.md)
+
 유튜브 영상으로 영어 쉐도잉을 연습하는 데스크톱 앱 (C++, Windows / macOS).
 
 링크 하나만 넣으면 영상과 영어 자막을 받아 문장 단위로 나눠 주고, 문장별로 반복 재생 · 쉐도잉 · 따라말하기 녹음을 한 뒤 whisper 음성 인식으로 발음을 채점합니다. 연습 기록은 SQLite에 쌓이고, 간격 반복 방식으로 복습할 문장을 골라 줍니다.
@@ -33,7 +35,7 @@
   - 문장마다 한국어 번역, 배울 만한 표현(뜻 · 뉘앙스 · 예문), 문법 포인트를 생성. 앞뒤 문장을 문맥으로 함께 보냄
   - 한 문장씩 또는 영상 전체를 한 번에 생성하고 DB 에 캐시
   - 마음에 드는 표현은 [저장] → 표현 노트에 모이고, 간격 반복으로 복습 세션에 카드로 나온다 (앞면 표현 → 뜻 보기 → 평가)
-  - API 키는 Windows DPAPI 로 암호화해 이 PC 의 사용자 계정으로만 풀 수 있게 저장
+  - API 키는 Windows 는 DPAPI, macOS 는 Keychain 으로 이 PC 의 사용자 계정만 풀 수 있게 암호화해 저장
 - **기록과 복습** (SQLite)
   - 홈: 영상별 진행률, 연습 횟수, 평균 점수, 마지막 연습, 최근 30일 그래프, 연속 학습일
   - 문장별 연습 이력과 예전 녹음 다시 듣기, 북마크
@@ -41,7 +43,7 @@
   - 복습 세션: [복습 시작] 한 번으로 복습할 문장을 순서대로 열어 준다
 - **파형 표시**: 원본 문장과 내 녹음의 파형을 나란히 표시
 - **음량**: 영상 음량과 내 녹음 재생 음량을 따로 조절 (설정 기억)
-- **단어 발음**: 현재 문장이 단어 버튼으로 펼쳐지고, 클릭하면 Windows 음성 합성(영어 음성)이 발음을 읽어 준다. 문장 전체 듣기와 천천히 듣기, 표현 탭과 복습 카드에도 [듣기]. 오프라인, 별도 설치 없음
+- **단어 발음**: 현재 문장이 단어 버튼으로 펼쳐지고, 클릭하면 시스템 음성 합성(영어 음성)이 발음을 읽어 준다. 문장 전체 듣기와 천천히 듣기, 표현 탭과 복습 카드에도 [듣기]. 오프라인, 별도 설치 없음
 
 ## 다운로드 (사용자용)
 
@@ -181,13 +183,14 @@ src/
   audio.cpp       miniaudio 녹음/재생, 파형 피크, 리샘플
   db.cpp          SQLite 저장소, 간격 반복, 통계, 설정, 해설 캐시, 표현 카드
   llm.cpp         Claude / OpenAI / Gemini REST 호출, 문장 해설 프롬프트
-  http.cpp        WinHTTP 기반 HTTPS 클라이언트
-  secret.cpp      DPAPI 로 API 키 암호화
+  http.cpp        HTTPS 클라이언트 (Windows: WinHTTP, macOS: libcurl)
+  secret.cpp      API 키 암호화 (Windows: DPAPI, macOS: Keychain + AES)
+  tts.cpp/.mm     단어 발음 (Windows: SAPI, macOS: AVSpeechSynthesizer)
   paths.cpp       데이터/모델 경로, 동봉 도구 PATH, 숨김 프로세스 실행
   main.cpp        CLI 버전 (초기 프로토타입)
   stt_test.cpp    STT + 채점 검증 도구
-scripts/setup-deps.ps1   의존성 설치
-scripts/package.ps1      배포 패키지 (zip + 설치 프로그램)
+scripts/setup-deps.ps1 · .sh   의존성 설치 (Windows · macOS)
+scripts/package.ps1 · .sh      배포 패키지 (Windows · macOS)
 installer/youshadow.iss  Inno Setup 스크립트
 .github/workflows/release.yml  태그 push 시 자동 빌드 · Release
 ```
