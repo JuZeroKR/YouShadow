@@ -2,6 +2,7 @@
 
 #ifdef _WIN32
 #include <windows.h>
+#include <commdlg.h>
 #else
 #include <CoreFoundation/CoreFoundation.h>
 #include <csignal>
@@ -34,7 +35,9 @@
 #include "audio.h"
 #include "db.h"
 #include "llm.h"
+#include "local.h"
 #include "paths.h"
+#include "subtitle.h"
 #include "player.h"
 #include "secret.h"
 #include "tts.h"
@@ -71,41 +74,64 @@ struct Loader {
         status = s;
     }
 
+    // 로컬 영상을 처음 등록할 때만 채운다 (비어 있으면 data/<id>/source.txt 로 다시 연다)
+    std::string localVideo, localSub;
+
     void start(const std::string& id) {
         if (th.joinable()) th.join();
+        const bool isLocal = local::isLocalId(id);
         {
             std::lock_guard<std::mutex> lock(m);
             busy = true;
             done = ok = false;
-            status = "다운로드 중... (콘솔 창에 진행 상황이 표시됩니다)";
+            status = isLocal ? "영상 준비 중... (오디오 추출, 자막 읽기)" : "다운로드 중... (콘솔 창에 진행 상황이 표시됩니다)";
         }
-        th = std::thread([this, id] {
+        const std::string lv = localVideo, ls = localSub;
+        localVideo.clear();
+        localSub.clear();
+        th = std::thread([this, id, isLocal, lv, ls] {
             LoadedVideo v;
             std::string err;
             try {
                 v.id = id;
                 v.dir = paths::dataDir() + "/" + id;
-                auto dl = yt::download(id, v.dir);
-                v.title = dl.title.empty() ? id : dl.title;
-                v.videoPath = fs::absolute(dl.videoPath).string();
-                v.audioPath = dl.audioPath;
+                std::string subtitlePath;
+                bool json3 = false;
+                if (isLocal) {
+                    local::Prepared p = lv.empty() ? local::reopen(v.dir) : local::prepare(lv, ls, v.dir);
+                    v.title = p.title;
+                    v.videoPath = p.videoPath;
+                    v.audioPath = p.audioPath;
+                    subtitlePath = p.subtitlePath;
+                } else {
+                    auto dl = yt::download(id, v.dir);
+                    v.title = dl.title.empty() ? id : dl.title;
+                    v.videoPath = fs::absolute(dl.videoPath).string();
+                    v.audioPath = dl.audioPath;
+                    subtitlePath = dl.subtitlePath;
+                    json3 = true;
+                }
 
                 const std::string segPath = v.dir + "/segments.json";
                 v.segs = transcript::load(segPath);
                 if (v.segs.empty()) {
-                    if (!dl.subtitlePath.empty()) {
-                        v.segs = transcript::parseJson3(dl.subtitlePath);
+                    if (!subtitlePath.empty()) {
+                        v.segs = json3 ? transcript::parseJson3(subtitlePath)
+                                       : transcript::splitWords(subtitle::parseFile(subtitlePath));
+                        if (v.segs.empty()) throw std::runtime_error("자막에서 문장을 만들지 못했습니다: " + subtitlePath);
                     } else {
                         if (!stt || !stt->loaded()) {
-                            throw std::runtime_error(
-                                "영어 자막을 받지 못했습니다 (자막이 없거나 유튜브가 자막 요청을 일시 차단). "
-                                "STT 모델이 준비되면 whisper 로 대본을 만들 수 있으니 잠시 후 다시 불러오세요");
+                            throw std::runtime_error(isLocal
+                                ? "자막을 찾지 못했습니다. 영상과 같은 이름의 .smi/.srt/.vtt 파일을 같은 폴더에 두거나 영상과 함께 끌어다 놓으세요. "
+                                  "STT 모델이 준비되면 whisper 로 대본을 만들 수도 있습니다"
+                                : "영어 자막을 받지 못했습니다 (자막이 없거나 유튜브가 자막 요청을 일시 차단). "
+                                  "STT 모델이 준비되면 whisper 로 대본을 만들 수 있으니 잠시 후 다시 불러오세요");
                         }
-                        setStatus("자막을 받지 못해 whisper 로 대본 생성 중... 0% (영상 길이에 따라 몇 분 걸립니다)");
-                        auto pcm16 = AudioEngine::loadWav(dl.audioPath, Stt::kRate);
+                        setStatus("자막이 없어 whisper 로 대본 생성 중... 0% (영상 길이에 따라 몇 분 걸립니다)");
+                        auto pcm16 = AudioEngine::loadWav(v.audioPath, Stt::kRate);
                         std::string serr;
                         auto words = stt->transcribe(pcm16, [this](int p) {
-                            setStatus("자막을 받지 못해 whisper 로 대본 생성 중... " + std::to_string(p) + "%");
+                            setStatus("자막이 없어 whisper 로 대본 생성 중... " + std::to_string(p) + "%");
                         }, &serr);
                         if (!serr.empty()) throw std::runtime_error(serr);
                         v.segs = transcript::splitWords(std::move(words));
@@ -114,7 +140,7 @@ struct Loader {
                     transcript::save(v.segs, segPath);
                 }
                 setStatus("파형 분석 중...");
-                v.peaks = AudioEngine::loadPeaks(dl.audioPath, kPeakBinMs);
+                v.peaks = AudioEngine::loadPeaks(v.audioPath, kPeakBinMs);
             } catch (const std::exception& e) {
                 err = e.what();
             }
@@ -1041,11 +1067,91 @@ struct App {
     }
 
     void requestLoad(const std::string& input) {
-        auto id = yt::extractVideoId(input);
-        if (!id) { message = "유튜브 영상 ID를 찾을 수 없습니다"; return; }
+        std::string in = input;
+        while (!in.empty() && std::isspace((unsigned char)in.back())) in.pop_back();
+        while (!in.empty() && std::isspace((unsigned char)in.front())) in.erase(0, 1);
+        if (in.size() >= 2 && in.front() == '"' && in.back() == '"') in = in.substr(1, in.size() - 2);
+        if (local::isLocalId(in)) { loader.stt = &stt; loader.start(in); return; }
+        // 내 PC 의 파일 경로?
+        std::error_code ec;
+        if (fs::is_regular_file(fs::u8path(in), ec)) {
+            std::string ext = fs::u8path(in).extension().u8string();
+            if (local::isVideoExt(ext)) { requestLoadFile(in, ""); return; }
+            if (subtitle::isSubtitleExt(ext)) { attachSubtitle(in); return; }
+            message = "지원하지 않는 파일입니다 (영상: mkv/mp4/avi/mov/webm, 자막: smi/srt/vtt)";
+            return;
+        }
+        auto id = yt::extractVideoId(in);
+        if (!id) { message = "유튜브 영상 ID 나 영상 파일 경로로 인식되지 않습니다"; return; }
         loader.stt = &stt;
         loader.start(*id);
     }
+
+    // ---- 내 영상 파일 ----
+    void requestLoadFile(const std::string& videoPath, const std::string& subPath) {
+        if (loader.busy) { message = "다른 영상을 불러오는 중입니다"; return; }
+        const std::string id = local::makeId(videoPath);
+        const std::string dir = paths::dataDir() + "/" + id;
+        std::error_code ec;
+        const bool registered = fs::exists(fs::u8path(dir + "/segments.json"), ec);
+        std::string sub = subPath;
+        if (registered) {
+            // 이미 등록된 영상: 자막을 새로 지정했으면 교체 (학습 기록이 있으면 문장 번호가 어긋나므로 거부)
+            if (!sub.empty()) {
+                if (db.countsFor(id).empty()) local::replaceSubtitle(sub, dir);
+                else message = "이미 학습 기록이 있는 영상이라 자막은 바꾸지 않고 그대로 엽니다";
+            }
+            sub.clear();
+        } else if (sub.empty()) {
+            sub = local::findSiblingSubtitle(videoPath);
+        }
+        loader.localVideo = videoPath;
+        loader.localSub = sub;
+        snprintf(urlBuf, sizeof urlBuf, "%s", videoPath.c_str());
+        loader.stt = &stt;
+        loader.start(id);
+    }
+
+    // 자막 파일만 들어왔을 때: 열려 있는 로컬 영상의 자막으로 바꾼다
+    void attachSubtitle(const std::string& subPath) {
+        if (!loaded || !local::isLocalId(video.id)) { message = "자막을 적용할 영상 파일을 먼저 여세요 (영상과 자막을 함께 끌어다 놓아도 됩니다)"; return; }
+        if (loader.busy) { message = "다른 영상을 불러오는 중입니다"; return; }
+        if (!db.countsFor(video.id).empty()) { message = "이미 학습 기록이 있는 영상이라 자막을 바꿀 수 없습니다 (문장 번호가 어긋납니다)"; return; }
+        local::replaceSubtitle(subPath, video.dir);
+        loader.stt = &stt;
+        loader.start(video.id);
+    }
+
+    void onDropFiles(const std::vector<std::string>& paths) {
+        std::string videoPath, subPath;
+        for (const auto& p : paths) {
+            std::string ext = fs::u8path(p).extension().u8string();
+            if (local::isVideoExt(ext) && videoPath.empty()) videoPath = p;
+            else if (subtitle::isSubtitleExt(ext) && subPath.empty()) subPath = p;
+        }
+        if (!videoPath.empty()) requestLoadFile(videoPath, subPath);
+        else if (!subPath.empty()) attachSubtitle(subPath);
+        else message = "영상 파일(mkv/mp4 …) 이나 자막 파일(smi/srt/vtt) 을 끌어다 놓으세요";
+    }
+
+#ifdef _WIN32
+    void openFileDialog() {
+        wchar_t file[4096] = L"";
+        OPENFILENAMEW ofn{};
+        ofn.lStructSize = sizeof ofn;
+        ofn.hwndOwner = GetActiveWindow();
+        ofn.lpstrFilter = L"영상 파일\0*.mkv;*.mp4;*.avi;*.mov;*.webm;*.m4v;*.ts;*.wmv;*.flv;*.mpg;*.mpeg\0모든 파일\0*.*\0";
+        ofn.lpstrFile = file;
+        ofn.nMaxFile = (DWORD)(sizeof file / sizeof file[0]);
+        ofn.lpstrTitle = L"영상 파일 열기 (같은 이름의 .smi/.srt/.vtt 자막이 있으면 함께 읽습니다)";
+        ofn.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR | OFN_EXPLORER;
+        if (!GetOpenFileNameW(&ofn)) return;
+        int n = WideCharToMultiByte(CP_UTF8, 0, file, -1, nullptr, 0, nullptr, nullptr);
+        std::string path(n > 0 ? n - 1 : 0, '\0');
+        if (n > 0) WideCharToMultiByte(CP_UTF8, 0, file, -1, &path[0], n, nullptr, nullptr);
+        if (!path.empty()) requestLoadFile(path, "");
+    }
+#endif
 
     // ---------------- UI ----------------
 
@@ -1880,7 +1986,7 @@ struct App {
             bool isOpen = loaded && video.id == v.id;
             if (ImGui::Selectable("##card", isOpen, 0, ImVec2(0, h))) openVideoFromLibrary(v.id);
             if (ImGui::BeginPopupContextItem("ctx")) {
-                ImGui::TextDisabled("%s", v.title.c_str());
+                ImGui::TextDisabled("%s%s", local::isLocalId(v.id) ? "[내 파일] " : "", v.title.c_str());
                 if (ImGui::MenuItem("이 영상의 연습 기록 삭제 (파일은 유지)")) {
                     db.deleteVideo(v.id);
                     libraryDirty = true;
@@ -2109,7 +2215,7 @@ struct App {
         std::string cmd, arg;
         ss >> cmd >> arg;
         fprintf(stderr, "[script] %s %s\n", cmd.c_str(), arg.c_str());
-        if (cmd == "load") { snprintf(urlBuf, sizeof urlBuf, "%s", arg.c_str()); requestLoad(arg); }
+        if (cmd == "load") { std::string rest; std::getline(ss, rest); snprintf(urlBuf, sizeof urlBuf, "%s", (arg + rest).c_str()); requestLoad(arg + rest); }
         else if (cmd == "wait") scriptWaitUntil = Clock::now() + std::chrono::milliseconds((int)(std::stod(arg) * 1000));
         else if (cmd == "play") playSegment(std::stoi(arg), loopsSetting);
         else if (cmd == "echo") startEcho(std::stoi(arg));
@@ -2181,10 +2287,15 @@ struct App {
         if (showHome) ImGui::EndDisabled();
         ImGui::SameLine();
         ImGui::SetNextItemWidth(420 * uiScale);
-        bool enter = ImGui::InputTextWithHint("##url", "유튜브 URL 또는 영상 ID", urlBuf, sizeof urlBuf, ImGuiInputTextFlags_EnterReturnsTrue);
+        bool enter = ImGui::InputTextWithHint("##url", "유튜브 URL / 영상 ID / 내 영상 파일 경로 (파일을 창에 끌어다 놓아도 됩니다)", urlBuf, sizeof urlBuf, ImGuiInputTextFlags_EnterReturnsTrue);
         ImGui::SameLine();
         ImGui::BeginDisabled(busy);
         if (ImGui::Button("불러오기") || enter) requestLoad(urlBuf);
+#ifdef _WIN32
+        ImGui::SameLine();
+        if (ImGui::Button("파일 열기")) openFileDialog();
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("내 PC 의 영상 파일(mkv, mp4 …)을 엽니다.\n같은 폴더에 같은 이름의 .smi/.srt/.vtt 자막이 있으면 함께 읽고,\n없으면 영상 안의 영어 자막 트랙을 찾고, 그것도 없으면 whisper 로 대본을 만듭니다.");
+#endif
         ImGui::EndDisabled();
         ImGui::SameLine(0, 16);
         if (ImGui::Button(llm.ready() ? "AI 설정" : "AI 설정 (키 없음)")) showSettings = true;
@@ -2367,6 +2478,14 @@ int main(int argc, char** argv) {
     App app;
     app.uiScale = uiScale;
     app.window = window;
+    glfwSetWindowUserPointer(window, &app);
+    glfwSetDropCallback(window, [](GLFWwindow* w, int count, const char** paths) {
+        auto* a = static_cast<App*>(glfwGetWindowUserPointer(w));
+        if (!a) return;
+        std::vector<std::string> files;
+        for (int i = 0; i < count; ++i) files.emplace_back(paths[i]);  // GLFW 는 UTF-8 로 준다
+        a->onDropFiles(files);
+    });
     std::string err;
     if (!app.mpv.init([](const char* n) { return (void*)glfwGetProcAddress(n); }, &err)) {
         fatalBox("영상 재생기(libmpv) 초기화 실패: " + err);

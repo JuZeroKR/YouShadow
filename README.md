@@ -21,6 +21,7 @@
 ## 기능
 
 - **영상 불러오기**: 유튜브 URL → yt-dlp 로 720p 영상과 영어 자막(json3) 다운로드. 자막이 없거나 유튜브가 자막 요청을 막으면 whisper.cpp 로 대본을 만든다
+- **내 영상 파일**: mkv · mp4 · avi · mov · webm 등 PC 에 있는 영상도 [파일 열기] 나 창에 끌어다 놓기로 연다. 같은 폴더의 같은 이름 자막(.smi / .srt / .vtt, `이름.en.srt` 같은 변형 포함) 을 자동으로 읽고, 없으면 영상 안의 영어 자막 트랙을 뽑고, 그것도 없으면 whisper 로 대본을 만든다. SMI 는 CP949 · UTF-8 · UTF-16 을 모두 읽고 여러 언어가 섞여 있으면 영어 클래스를 고른다. 영상은 복사하지 않고 원본 경로만 기억한다
 - **문장 분할**: 단어 타임스탬프를 문장 부호 · 침묵 · 길이 기준으로 나눠 문장 목록을 만든다
 - **재생**: libmpv 로 영상 재생. 문장 클릭 재생, 반복, 속도 0.5x~1.5x (피치 유지), 자유 재생 중 현재 문장 하이라이트
 - **연습 모드**
@@ -136,6 +137,8 @@ run-gui.cmd https://www.youtube.com/watch?v=VIDEO_ID
 
 실행하면 홈 화면이 뜹니다. 상단 입력창에 URL 을 넣고 [불러오기]를 누르면 다운로드 후 학습 화면으로 넘어갑니다. 처음 한 번만 받고 그 뒤로는 캐시를 씁니다.
 
+내 PC 의 영상은 [파일 열기] 로 고르거나 영상 파일(자막 파일과 함께여도 됨) 을 창에 끌어다 놓으면 됩니다. 입력창에 파일 경로를 붙여 넣어도 됩니다. 영상과 같은 이름의 .smi/.srt/.vtt 가 같은 폴더에 있으면 자동으로 읽습니다. 자막 파일만 끌어다 놓으면 열려 있는 영상의 자막을 바꿉니다 (학습 기록이 아직 없는 영상만).
+
 저장소 루트에서 실행하면(개발 모드) `data/`, `models/` 를 쓰고, 그 외에는 Windows 는 `%LOCALAPPDATA%\YouShadow`, macOS 는 `~/Library/Application Support/YouShadow` 를 씁니다. 외부 도구 출력은 그 아래 `logs/tools.log` 에 남습니다.
 
 ### 단축키
@@ -181,6 +184,8 @@ src/
   player.cpp      libmpv → OpenGL FBO 텍스처
   youtube.cpp     URL 파싱, yt-dlp / ffmpeg 호출
   transcript.cpp  단어 목록 → 문장 세그먼트, json3 자막 파싱
+  subtitle.cpp    SMI / SRT / VTT 자막 파일 → 단어 목록 (인코딩 감지, 영어 클래스 선택)
+  local.cpp       내 영상 파일 등록 (ID, 자막 찾기, 내장 자막 추출, 오디오 추출)
   stt.cpp         whisper.cpp 래퍼 (단어 타임스탬프 / 텍스트)
   scoring.cpp     원문 vs 인식 결과 편집 거리 정렬, 정확도
   audio.cpp       miniaudio 녹음/재생, 파형 피크, 리샘플

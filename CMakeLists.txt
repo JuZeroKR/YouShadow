@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(YouShadow VERSION 0.5.1 LANGUAGES C CXX)
+project(YouShadow VERSION 0.6.0 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -62,6 +62,8 @@ add_library(ys_core STATIC
     src/secret.cpp
     src/llm.cpp
     src/tts.cpp
+    src/subtitle.cpp
+    src/local.cpp
 )
 if(APPLE)
     target_sources(ys_core PRIVATE src/tts_mac.mm)
@@ -127,6 +129,7 @@ if(WIN32)
         ${TP}/glfw/lib-vc2022/glfw3_mt.lib
         ${TP}/mpv/libmpv.lib
         opengl32
+        comdlg32
     )
     target_link_options(youshadow-gui PRIVATE /ENTRY:mainCRTStartup)
     add_custom_command(TARGET youshadow-gui POST_BUILD
