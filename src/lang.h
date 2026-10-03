@@ -3,10 +3,11 @@
 #include <vector>
 
 // 학습 언어. 영상마다 하나씩 붙고(videos.lang), 자막 언어 · whisper 언어 · 음성 · AI 프롬프트 · 채점 단위를 정한다.
-enum class Lang { En = 0, Ja = 1 };
+// Ko 는 학습 언어가 아니라 음성(TTS) 선택에만 쓴다 (일본어 음성이 없을 때 한국어 발음 표기를 읽어 주는 용도).
+enum class Lang { En = 0, Ja = 1, Ko = 2 };
 
-const char* langCode(Lang l);   // "en" / "ja"
-const char* langName(Lang l);   // "영어" / "일본어"
+const char* langCode(Lang l);   // "en" / "ja" / "ko"
+const char* langName(Lang l);   // "영어" / "일본어" / "한국어"
 Lang langFromCode(const std::string& code);
 
 // 일본어 텍스트 보조 (사전 없이 되는 범위만)

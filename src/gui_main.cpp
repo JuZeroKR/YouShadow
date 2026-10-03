@@ -419,13 +419,19 @@ struct App {
     std::vector<int> readingPending;         // 작업 중에 들어온 요청
     bool showPron = true;                    // 자막 아래 한국어 발음 표시
 
+    // AI 는 자동으로 부르지 않는다 (토큰 비용). 버튼으로 요청하기 전까지는 가나만 변환한 간이 읽기를 쓴다.
     const JaReading& readingFor(int i) {
         auto it = readings.find(i);
         if (it != readings.end()) return it->second;
-        if (llm.ready() && !readingRequested.count(i)) { readingRequested.insert(i); requestReadings({i}); }
         auto& r = roughReadings[i];
         if (r.empty()) r = roughJapaneseReading(seg(i).text);
         return r;
+    }
+
+    bool readingInProgress(int i) {
+        std::lock_guard<std::mutex> lock(readingJob.m);
+        if (readingJob.running && std::find(readingJob.queue.begin(), readingJob.queue.end(), i) != readingJob.queue.end()) return true;
+        return std::find(readingPending.begin(), readingPending.end(), i) != readingPending.end();
     }
 
     void requestReadings(std::vector<int> idxs) {
@@ -486,9 +492,42 @@ struct App {
     }
 
     void speak(const std::string& text) { speak(text, curLang()); }
+
+    // 일본어 텍스트의 한국어 발음 표기 (단어 팝업 → 현재 문장의 토큰 → 문장 전체 → 가나 변환 순으로 찾는다)
+    std::string koreanPronunciationFor(const std::string& text) {
+        if (text == wordKey && !wordInfo.korean.empty()) return wordInfo.korean;
+        if (text == wordKey && !wordHintKorean.empty()) return wordHintKorean;
+        if (loaded && valid(current) && video.lang == Lang::Ja) {
+            const JaReading& rd = readingFor(current);
+            if (text == seg(current).text && !rd.pronunciation.empty()) return rd.pronunciation;
+            for (const auto& t : rd.tokens) if (t.surface == text && !t.korean.empty()) return t.korean;
+        }
+        bool kanaOnly = true;
+        for (const auto& ch : jp::splitChars(text)) { unsigned cp = jp::decodeFirst(ch); if (jp::isKanji(cp)) { kanaOnly = false; break; } }
+        if (kanaOnly) return jp::kanaToKorean(text);
+        // 한자가 섞여 있으면 아는 부분(가나)만이라도 읽는다 — 한자는 건너뛴다
+        std::string partial;
+        for (const auto& ch : jp::splitChars(text)) { unsigned cp = jp::decodeFirst(ch); if (!jp::isKanji(cp)) partial += ch; }
+        std::string ko = jp::kanaToKorean(partial);
+        bool hasHangul = false;
+        for (const auto& ch : jp::splitChars(ko)) { unsigned cp = jp::decodeFirst(ch); if (cp >= 0xAC00 && cp <= 0xD7A3) { hasHangul = true; break; } }
+        return hasHangul ? ko : "";
+    }
     void speak(const std::string& text, Lang lang) {
         if (!tts.available()) { message = "이 PC 에 음성 합성 엔진이 없습니다"; return; }
-        if (!tts.hasVoice(lang) && lang == Lang::Ja) message = "일본어 음성이 설치되어 있지 않아 영어 음성으로 읽습니다 (Windows 설정 > 시간 및 언어 > 음성 > 음성 추가 > 일본어)";
+        if (lang == Lang::Ja && !tts.hasVoice(Lang::Ja)) {
+            // 일본어 음성이 없으면 영어 음성은 가나/한자를 읽지 못해 소리가 나지 않는다.
+            // 대신 한국어 발음 표기를 한국어 음성으로 읽어 준다 (근사치).
+            const std::string ko = koreanPronunciationFor(text);
+            if (!ko.empty() && tts.hasVoice(Lang::Ko)) {
+                tts.speak(ko, ttsSlow ? -4 : 0, Lang::Ko);
+                message = "일본어 음성이 없어 한국어 음성으로 발음 표기를 읽습니다. 원어 발음은 Windows 설정 > 시간 및 언어 > 음성 > 음성 추가 > 일본어";
+            } else {
+                message = ko.empty() ? "이 단어의 발음 표기가 아직 없습니다 ([이 문장 읽기 만들기] 로 만들면 들을 수 있습니다). 원어 발음은 Windows 에 일본어 음성을 추가하세요"
+                                     : "일본어 음성이 없습니다. Windows 설정 > 시간 및 언어 > 음성 > 음성 추가 > 일본어";
+            }
+            return;
+        }
         tts.speak(text, ttsSlow ? -4 : 0, lang);
     }
 
@@ -1370,7 +1409,7 @@ struct App {
                 ImGui::BeginDisabled(!llm.ready());
                 if (ImGui::SmallButton("모든 문장 읽기 만들기 (AI)")) requestAllReadings();
                 ImGui::EndDisabled();
-                if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) ImGui::SetTooltip("문장마다 AI 를 한 번씩 호출해 한자 읽기와 한국어 발음을 만들어 목록에 표시합니다.%s", llm.ready() ? "" : "\nAI 설정에서 API 키를 먼저 넣으세요.");
+                if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) ImGui::SetTooltip("아직 읽기가 없는 %d개 문장마다 AI 를 한 번씩 호출합니다 (토큰이 그만큼 듭니다).\n만든 읽기는 저장되어 다시 호출하지 않습니다.%s", (int)video.segs.size() - (int)readings.size(), llm.ready() ? "" : "\nAI 설정에서 API 키를 먼저 넣으세요.");
             } else ImGui::TextDisabled("읽기 %d/%d", (int)readings.size(), (int)video.segs.size());
         }
         ImGui::Separator();
@@ -1994,8 +2033,16 @@ struct App {
                 ImGui::PopStyleColor();
             }
             if (rd->provider == "간이") {
-                ImGui::TextDisabled("%s", llm.ready() ? "AI 로 읽기를 만드는 중... (가나만 먼저 변환해 보여 줍니다)"
-                                                      : "AI 설정에서 API 키를 넣으면 한자 읽기와 정확한 발음, 단어 뜻을 표시합니다. 지금은 가나만 변환합니다.");
+                if (readingInProgress(current)) {
+                    ImGui::TextColored(ImVec4(1, 0.8f, 0.3f, 1), "AI 로 읽기를 만드는 중...");
+                } else {
+                    ImGui::BeginDisabled(!llm.ready());
+                    if (ImGui::SmallButton("이 문장 읽기 만들기 (AI)")) { readingRequested.insert(current); requestReadings({current}); }
+                    ImGui::EndDisabled();
+                    ImGui::SameLine();
+                    ImGui::TextDisabled("%s", llm.ready() ? "지금은 가나만 변환한 상태입니다. 한자 읽기와 정확한 단어 분할은 AI 로 만듭니다 (문장당 호출 1회, 저장되어 다시 쓰지 않음)"
+                                                          : "지금은 가나만 변환한 상태입니다. AI 설정에서 API 키를 넣으면 한자 읽기를 만들 수 있습니다");
+                }
             } else {
                 ImGui::SameLine(0, 12);
                 ImGui::TextDisabled("%s · %s", rd->provider.c_str(), rd->model.c_str());
@@ -2450,7 +2497,7 @@ struct App {
         else if (cmd == "explain" && valid(current)) requestExplain({current});
         else if (cmd == "explain_all") requestExplainAll();
         else if (cmd == "settings") showSettings = true;
-        else if (cmd == "say") { std::string rest; std::getline(ss, rest); speak(arg + rest); fprintf(stderr, "[tts] voice=%s available=%d\n", tts.voiceName().c_str(), (int)tts.available()); }
+        else if (cmd == "say") { std::string rest; std::getline(ss, rest); speak(arg + rest); fprintf(stderr, "[tts] en=%s ja=%s ko=%s available=%d msg=%s\n", tts.voiceName(Lang::En).c_str(), tts.voiceName(Lang::Ja).c_str(), tts.voiceName(Lang::Ko).c_str(), (int)tts.available(), message.c_str()); }
         else if (cmd == "tab") forceTab = arg == "explain" ? Tab::Explain : arg == "cards" ? Tab::Cards : arg == "review" ? Tab::Review : arg == "history" ? Tab::History : arg == "quiz" ? Tab::Quiz : Tab::Sentences;
         else if (cmd == "quiz") startQuiz(std::max(0, current), arg == "compose" ? 1 : 0);
         else if (cmd == "quiz_answer") { std::string rest; std::getline(ss, rest); snprintf(quizBuf, sizeof quizBuf, "%s", (arg + rest).c_str()); checkQuiz(); }

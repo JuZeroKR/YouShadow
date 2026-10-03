@@ -3,8 +3,8 @@
 #include <cctype>
 #include <map>
 
-const char* langCode(Lang l) { return l == Lang::Ja ? "ja" : "en"; }
-const char* langName(Lang l) { return l == Lang::Ja ? "일본어" : "영어"; }
+const char* langCode(Lang l) { return l == Lang::Ja ? "ja" : l == Lang::Ko ? "ko" : "en"; }
+const char* langName(Lang l) { return l == Lang::Ja ? "일본어" : l == Lang::Ko ? "한국어" : "영어"; }
 Lang langFromCode(const std::string& code) { return code.rfind("ja", 0) == 0 ? Lang::Ja : Lang::En; }
 
 namespace jp {

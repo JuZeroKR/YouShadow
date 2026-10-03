@@ -11,6 +11,7 @@ struct TtsImpl {
     AVSpeechSynthesizer* synth = nil;
     AVSpeechSynthesisVoice* voiceEn = nil;
     AVSpeechSynthesisVoice* voiceJa = nil;
+    AVSpeechSynthesisVoice* voiceKo = nil;
     float volume = 1.0f;
 };
 
@@ -32,6 +33,7 @@ Tts::~Tts() {
         [p->synth release];
         [p->voiceEn release];
         [p->voiceJa release];
+        [p->voiceKo release];
         delete p;
         voice_ = nullptr;
     }
@@ -46,8 +48,10 @@ bool Tts::init() {
     }
     p->voiceEn = [findVoice(@"en-US", @"en") retain];
     p->voiceJa = [findVoice(@"ja-JP", @"ja") retain];
+    p->voiceKo = [findVoice(@"ko-KR", @"ko") retain];
     if (p->voiceEn && p->voiceEn.name) voiceNameEn_ = [p->voiceEn.name UTF8String];
     if (p->voiceJa && p->voiceJa.name) voiceNameJa_ = [p->voiceJa.name UTF8String];
+    if (p->voiceKo && p->voiceKo.name) voiceNameKo_ = [p->voiceKo.name UTF8String];
     voice_ = p;
     return true;
 }
@@ -55,7 +59,7 @@ bool Tts::init() {
 bool Tts::hasVoice(Lang lang) const {
     if (!voice_) return false;
     auto* p = (TtsImpl*)voice_;
-    return lang == Lang::Ja ? p->voiceJa != nil : p->voiceEn != nil;
+    return lang == Lang::Ja ? p->voiceJa != nil : lang == Lang::Ko ? p->voiceKo != nil : p->voiceEn != nil;
 }
 
 void Tts::speak(const std::string& text, int rate, Lang lang) {
@@ -65,7 +69,7 @@ void Tts::speak(const std::string& text, int rate, Lang lang) {
     NSString* s = [NSString stringWithUTF8String:text.c_str()];
     if (!s) return;
     AVSpeechUtterance* u = [AVSpeechUtterance speechUtteranceWithString:s];
-    AVSpeechSynthesisVoice* v = lang == Lang::Ja ? p->voiceJa : p->voiceEn;
+    AVSpeechSynthesisVoice* v = lang == Lang::Ja ? p->voiceJa : lang == Lang::Ko ? p->voiceKo : p->voiceEn;
     if (!v) v = p->voiceEn ? p->voiceEn : p->voiceJa;
     if (v) u.voice = v;
     // SAPI 의 -10~10 을 AVSpeech 의 0~1 로 맞춘다 (0 → 기본 0.5)
