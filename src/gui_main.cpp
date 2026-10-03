@@ -1618,8 +1618,6 @@ struct App {
         ImGui::TextDisabled("단어:");
         ImGui::SameLine();
         ImGui::BeginDisabled(!tts.available());
-        if (ImGui::SmallButton("문장 듣기")) speak(sentence);
-        ImGui::SameLine();
         if (ImGui::Checkbox("천천히", &ttsSlow)) db.setSetting("tts.slow", ttsSlow ? "1" : "0");
         ImGui::EndDisabled();
         if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) {
