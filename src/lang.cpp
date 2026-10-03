@@ -162,6 +162,14 @@ std::string kanaToKorean(const std::string& utf8) {
             continue;
         }
         if (cp == 0x30FC || ch == "ー") continue;  // 장음은 한국어 표기에서 생략
+        // お단 · う단 뒤의 う 는 장음 (とうきょう → 토쿄, くうき → 쿠키): 생략
+        if (ch == "う" && !out.empty()) {
+            unsigned prev = decodeFirst(out.back());
+            if (isHangul(prev)) {
+                int jung = ((prev - 0xAC00) / 28) % 21;
+                if (jung == 8 || jung == 12 || jung == 13 || jung == 17) continue;  // ㅗ ㅛ ㅜ ㅠ
+            }
+        }
         if (i + 1 < chars.size()) {
             auto it = table.find(ch + chars[i + 1]);
             if (it != table.end()) { out.push_back(it->second); ++i; continue; }

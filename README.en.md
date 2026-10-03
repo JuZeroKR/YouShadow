@@ -24,7 +24,11 @@ Paste a link and it downloads the video with English subtitles, splits them into
 
 - **Load a video**: YouTube URL → yt-dlp downloads a 720p video and English subtitles (json3). If there are no subtitles, or YouTube blocks the subtitle request, a transcript is generated with whisper.cpp
 - **Your own video files**: open mkv / mp4 / avi / mov / webm files from your PC with [파일 열기] or by dropping them onto the window. A subtitle with the same name in the same folder (.smi / .srt / .vtt, including variants like `name.en.srt`) is picked up automatically; otherwise an English subtitle track inside the video is extracted, and failing that whisper generates a transcript. SMI files are read in CP949, UTF-8, or UTF-16, and when several languages are present the English class is chosen. The video itself is not copied — only its path is remembered
-- **Japanese mode**: pick English or Japanese as the study language on the home screen. Japanese videos download Japanese subtitles, each sentence is split into word tokens with the **Korean pronunciation** under every token and a whole-sentence pronunciation line under the subtitle (so you can shadow even when you cannot read the kanji). Click a token for its reading (hiragana), Korean pronunciation, meaning and how it is used in the sentence. By default only kana is converted; the AI tokenizes and reads kanji only when you press [이 문장 읽기 만들기] (this sentence) or [모든 문장 읽기 만들기] (all sentences) — one call per sentence, stored in the DB so it is never requested twice. The AI is never called automatically. Scoring uses the multilingual whisper small model (466MB) and compares character by character; pronunciation uses a Japanese voice (Windows needs the Japanese language pack, macOS has Kyoko built in)
+- **Japanese mode**: pick English or Japanese as the study language on the home screen. Japanese videos download Japanese subtitles, each sentence is split into morphemes with the **Korean pronunciation** under every token and a whole-sentence pronunciation line under the subtitle (so you can shadow even when you cannot read the kanji). Click a token for its base form, reading (hiragana), Korean pronunciation, part of speech and English meaning
+  - **Offline dictionary**: press [일본어 사전 받기] once to download a ~17MB pack and segmentation, readings, pronunciation and meanings all work without AI. Segmentation is an in-house Viterbi lattice over MeCab's IPADIC dictionary (`src/jadict.cpp`); meanings are JMdict English glosses. Pronunciation rules such as the particle は→와 and long vowels (とうきょう→토쿄) follow the dictionary's pronunciation field
+  - The AI is never called automatically; [AI 로 한국어 설명] in the word popup makes one call and stores the result. [이 문장만 AI 로] exists as a fallback when the dictionary is not installed
+  - Scoring uses the multilingual whisper small model (466MB), converting both the original and the recognised text to kana readings before comparing, so kanji/kana spelling differences do not count as errors
+  - Spoken pronunciation uses a Japanese voice when present (Windows: Settings > Add voices > Japanese; macOS has Kyoko built in); otherwise the Korean voice reads the Korean transliteration
 - **Sentence splitting**: word timestamps are split into sentences by punctuation, silence, and length (Japanese: 。！？ and character count)
 - **Playback**: video via libmpv. Click a sentence to play it, loop, 0.5x–1.5x speed (pitch preserved), current sentence highlighted during free playback
 - **Practice modes**
@@ -189,6 +193,8 @@ src/
   player.cpp      libmpv → OpenGL FBO texture
   youtube.cpp     URL parsing, yt-dlp / ffmpeg invocation
   lang.cpp        study language (English/Japanese), Japanese helpers (rough tokenizer, kana → Korean pronunciation)
+  jadict.cpp      offline Japanese dictionary: IPADIC lattice + Viterbi segmentation, readings/pronunciation, JMdict glosses
+  tools/ja_dict_build.cpp  mecab-ipadic + JMdict_e → ipadic.bin / jmdict.bin pack builder (dev tool)
   transcript.cpp  word list → sentence segments, json3 subtitle parsing
   subtitle.cpp    SMI / SRT / VTT subtitle files → word list (encoding detection, English class selection)
   local.cpp       local video registration (ID, subtitle lookup, embedded-track extraction, audio extraction)
@@ -226,6 +232,13 @@ The design and code of this project were written in conversation with Anthropic'
 - Sentence editing (split / merge)
 - Larger whisper models (small.en), GPU acceleration
 - Intonation/pace comparison, phoneme-level pronunciation feedback
+
+## Dictionary data sources
+
+The offline dictionary pack for Japanese mode (GitHub release `ja-dict-v1`) is converted from the following data. Full licence texts are included in the pack.
+
+- **mecab-ipadic 2.7.0** (Nara Institute of Science and Technology, IPADIC licence) — segmentation and readings
+- **JMdict** (Electronic Dictionary Research and Development Group, CC BY-SA 4.0) — English glosses and part-of-speech tags
 
 ## License
 

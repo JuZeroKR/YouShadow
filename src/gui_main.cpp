@@ -34,6 +34,7 @@
 
 #include "audio.h"
 #include "db.h"
+#include "jadict.h"
 #include "llm.h"
 #include "local.h"
 #include "paths.h"
@@ -204,16 +205,24 @@ struct ScoreJob {
     ScoreResult result;
     std::string err;
 
-    void start(Stt* stt, long long pid, std::string reference, std::vector<float> pcm48k, Lang lang = Lang::En) {
+    // dict: 일본어면 원문과 인식 결과를 모두 읽기(히라가나)로 바꿔 비교한다 (한자/가나 표기 차이를 없앤다)
+    void start(Stt* stt, long long pid, std::string reference, std::vector<float> pcm48k, Lang lang = Lang::En, const JaDict* dict = nullptr) {
         if (th.joinable()) th.join();
         { std::lock_guard<std::mutex> lock(m); running = true; done = false; practiceId = pid; err.clear(); }
-        th = std::thread([this, stt, reference, lang, pcm = std::move(pcm48k)] {
+        th = std::thread([this, stt, reference, lang, dict, pcm = std::move(pcm48k)] {
             ScoreResult r;
             std::string e;
             try {
                 auto pcm16 = AudioEngine::resample(pcm, AudioEngine::kSampleRate, Stt::kRate);
                 std::string heard = stt->transcribeText(pcm16, &e);
-                if (e.empty()) r = scoreTranscript(reference, heard, lang);
+                if (e.empty()) {
+                    if (lang == Lang::Ja && dict && dict->loaded()) {
+                        r = scoreTranscript(dict->toReading(reference, true), dict->toReading(heard, true), lang);
+                        r.heard = heard;
+                    } else {
+                        r = scoreTranscript(reference, heard, lang);
+                    }
+                }
             } catch (const std::exception& ex) {
                 e = ex.what();
             }
@@ -255,6 +264,48 @@ struct App {
     Loader loader;
     SttLoader sttLoaderEn, sttLoaderJa;
     Lang uiLang = Lang::En;        // 새 영상을 불러올 때 쓰는 학습 언어 (홈에서 선택, 설정에 저장)
+
+    // ---- 일본어 오프라인 사전 (IPADIC + JMdict) ----
+    JaDict jaDict;
+    std::atomic<bool> jaReady{false};
+    struct DictLoader {
+        std::thread th;
+        std::mutex m;
+        bool busy = false, done = false, ok = false;
+        std::string status;
+        ~DictLoader() { if (th.joinable()) th.join(); }
+    } dictLoader;
+
+    void startDictLoad(bool download) {
+        if (dictLoader.busy) return;
+        if (dictLoader.th.joinable()) dictLoader.th.join();
+        { std::lock_guard<std::mutex> lock(dictLoader.m); dictLoader.busy = true; dictLoader.done = false; dictLoader.status = download ? "일본어 사전 다운로드 중 (약 " + std::to_string(JaDict::packSizeMB()) + "MB)..." : "일본어 사전 로딩 중..."; }
+        dictLoader.th = std::thread([this, download] {
+            std::string err;
+            try {
+                const std::string dir = JaDict::dir();
+                if (download && !JaDict::installed()) {
+                    fs::create_directories(fs::u8path(dir));
+                    const std::string zip = dir + "/pack.zip";
+                    std::string cmd = "curl -L --fail -o \"" + zip + "\" \"" + JaDict::packUrl() + "\"";
+                    if (paths::runCommand(cmd, yt::logPath()) != 0 || !fs::exists(fs::u8path(zip))) throw std::runtime_error("사전 다운로드 실패. 로그: " + yt::logPath());
+                    { std::lock_guard<std::mutex> lock(dictLoader.m); dictLoader.status = "일본어 사전 압축 해제 중..."; }
+                    if (paths::runCommand("tar -xf \"" + zip + "\" -C \"" + dir + "\"", yt::logPath()) != 0 || !JaDict::installed()) throw std::runtime_error("사전 압축 해제 실패. 로그: " + yt::logPath());
+                    std::error_code ec;
+                    fs::remove(fs::u8path(zip), ec);
+                }
+                { std::lock_guard<std::mutex> lock(dictLoader.m); dictLoader.status = "일본어 사전 로딩 중..."; }
+                if (!jaDict.load(&err)) throw std::runtime_error(err);
+            } catch (const std::exception& e) {
+                err = e.what();
+            }
+            std::lock_guard<std::mutex> lock(dictLoader.m);
+            dictLoader.busy = false;
+            dictLoader.done = true;
+            dictLoader.ok = err.empty();
+            dictLoader.status = dictLoader.ok ? "" : "일본어 사전 오류: " + err;
+        });
+    }
 
     Lang curLang() const { return loaded ? video.lang : uiLang; }
     Stt& sttFor(Lang l) { return l == Lang::Ja ? sttJa : sttEn; }
@@ -419,12 +470,41 @@ struct App {
     std::vector<int> readingPending;         // 작업 중에 들어온 요청
     bool showPron = true;                    // 자막 아래 한국어 발음 표시
 
-    // AI 는 자동으로 부르지 않는다 (토큰 비용). 버튼으로 요청하기 전까지는 가나만 변환한 간이 읽기를 쓴다.
+    // 읽기 우선순위: AI 가 만든 것(DB) → 오프라인 사전 → 가나만 변환한 간이 읽기. AI 는 자동으로 부르지 않는다 (토큰 비용).
     const JaReading& readingFor(int i) {
         auto it = readings.find(i);
         if (it != readings.end()) return it->second;
         auto& r = roughReadings[i];
-        if (r.empty()) r = roughJapaneseReading(seg(i).text);
+        if (r.empty()) r = jaReady ? dictReading(seg(i).text) : roughJapaneseReading(seg(i).text);
+        return r;
+    }
+
+    bool isFunctionWord(const std::string& pos) const {
+        return pos.rfind("助詞", 0) == 0 || pos.rfind("助動詞", 0) == 0 || pos.rfind("記号", 0) == 0;
+    }
+
+    // 오프라인 사전으로 만든 읽기: 형태소 단위 토큰 + 발음 + 짧은 영어 뜻
+    JaReading dictReading(const std::string& text) {
+        JaReading r;
+        for (const auto& m : jaDict.tokenize(text)) {
+            if (m.pos.rfind("記号", 0) == 0) continue;  // 구두점은 단어 줄에서 뺀다
+            JaToken t;
+            t.surface = m.surface;
+            t.reading = m.reading;
+            t.korean = JaDict::korean(m);
+            if (isFunctionWord(m.pos)) {
+                t.meaning = JaDict::posKorean(m.pos);
+            } else {
+                auto g = jaDict.lookup(m.base, m.base == m.surface ? m.reading : "", m.pos, 1);
+                if (!g.empty() && !g[0].senses.empty()) t.meaning = g[0].senses[0];
+            }
+            if (!r.reading.empty()) { r.reading += ' '; r.pronunciation += ' '; }
+            r.reading += t.reading.empty() ? t.surface : t.reading;
+            r.pronunciation += t.korean.empty() ? t.surface : t.korean;
+            r.tokens.push_back(std::move(t));
+        }
+        r.provider = "사전";
+        r.model = "IPADIC · JMdict";
         return r;
     }
 
@@ -843,7 +923,7 @@ struct App {
         scoreSeg = current;
         if (sttCur().loaded()) {
             scoring = true;
-            scoreJob.start(&sttCur(), pid, seg(current).text, myRec, video.lang);
+            scoreJob.start(&sttCur(), pid, seg(current).text, myRec, video.lang, jaReady ? &jaDict : nullptr);
         }
         return pid;
     }
@@ -925,7 +1005,13 @@ struct App {
 
     void checkQuiz() {
         if (!valid(quizSeg)) return;
-        quizScore = scoreTranscript(seg(quizSeg).text, quizBuf, video.lang);
+        if (video.lang == Lang::Ja && jaReady) {
+            // 한자/가나 표기 차이가 틀림으로 잡히지 않게 읽기로 비교한다
+            quizScore = scoreTranscript(jaDict.toReading(seg(quizSeg).text, true), jaDict.toReading(quizBuf, true), video.lang);
+            quizScore.heard = quizBuf;
+        } else {
+            quizScore = scoreTranscript(seg(quizSeg).text, quizBuf, video.lang);
+        }
         quizChecked = true;
         quizRevealed = true;
         long long pid = log(quizSeg, quizKind == 0 ? "listen" : "compose");
@@ -1095,6 +1181,21 @@ struct App {
             for (SttLoader* sl : {&sttLoaderEn, &sttLoaderJa}) {
                 std::lock_guard<std::mutex> lock(sl->m);
                 if (!sl->busy && !sl->status.empty()) { message = sl->status; sl->status.clear(); }
+            }
+        }
+        // 일본어 사전 로더
+        {
+            std::lock_guard<std::mutex> lock(dictLoader.m);
+            if (dictLoader.done) {
+                dictLoader.done = false;
+                if (dictLoader.ok) {
+                    jaReady = true;
+                    roughReadings.clear();  // 간이 읽기를 사전 읽기로 바꾼다
+                    message = "일본어 사전 준비 완료: 단어 분할 · 읽기 · 뜻을 오프라인으로 표시합니다";
+                } else {
+                    message = dictLoader.status;
+                    dictLoader.status.clear();
+                }
             }
         }
         // AI 모델 목록 / 연결 테스트
@@ -1405,7 +1506,11 @@ struct App {
             { std::lock_guard<std::mutex> lock(readingJob.m); running = readingJob.running; done = readingJob.done; total = (int)readingJob.queue.size(); }
             ImGui::SameLine(0, 12);
             if (running) ImGui::TextColored(ImVec4(1, 0.8f, 0.3f, 1), "읽기 생성 중 %d/%d", done, total);
+            else if (jaReady) ImGui::TextDisabled("읽기 · 발음: 오프라인 사전");
             else if ((int)readings.size() < (int)video.segs.size()) {
+                if (ImGui::SmallButton(JaDict::installed() ? "일본어 사전 로드" : "일본어 사전 받기")) startDictLoad(!JaDict::installed());
+                if (ImGui::IsItemHovered()) ImGui::SetTooltip("오프라인 사전(IPADIC + JMdict, 약 %dMB 한 번 다운로드)을 받으면\nAI 없이 모든 문장의 단어 분할 · 읽기 · 발음 · 영어 뜻이 나옵니다.", JaDict::packSizeMB());
+                ImGui::SameLine();
                 ImGui::BeginDisabled(!llm.ready());
                 if (ImGui::SmallButton("모든 문장 읽기 만들기 (AI)")) requestAllReadings();
                 ImGui::EndDisabled();
@@ -1429,7 +1534,7 @@ struct App {
             ImVec2 textSize = ImGui::CalcTextSize(s.text.c_str(), nullptr, false, wrap);
             // 일본어: AI 읽기가 있으면 한국어 발음을 한 줄 더 보여 준다
             const JaReading* rowRead = nullptr;
-            if (video.lang == Lang::Ja) { auto rit = readings.find(i); if (rit != readings.end() && !rit->second.pronunciation.empty()) rowRead = &rit->second; }
+            if (video.lang == Lang::Ja && (jaReady || readings.count(i))) { const JaReading& rr = readingFor(i); if (!rr.pronunciation.empty()) rowRead = &rr; }
             ImVec2 pronSize = rowRead ? ImGui::CalcTextSize(rowRead->pronunciation.c_str(), nullptr, false, wrap) : ImVec2(0, 0);
             float h = ImGui::GetTextLineHeight() + textSize.y + pronSize.y + 6;
             bool selected = (i == current);
@@ -1878,12 +1983,59 @@ struct App {
         std::string cached = db.getWordMeaning(wordKey, sentence);
         if (!cached.empty()) {
             WordMeaning c = WordMeaning::fromJson(cached);
-            // 사전 결과만 있는데 지금은 AI 를 쓸 수 있으면 다시 찾는다
-            if (!c.empty() && !(c.provider == "사전" && llm.ready())) { wordInfo = c; return; }
+            // 사전 결과만 있는데 지금은 AI 를 쓸 수 있으면 다시 찾는다 (영어만. 일본어는 사전이 기본이고 AI 는 버튼으로)
+            if (!c.empty() && !(c.provider == "사전" && llm.ready() && curLang() != Lang::Ja)) { wordInfo = c; return; }
+        }
+        // 일본어: 오프라인 사전이 있으면 AI 없이 바로 채운다 (AI 는 팝업의 버튼으로만)
+        if (curLang() == Lang::Ja && jaReady) {
+            wordInfo = dictWord(word, sentence);
+            if (!wordInfo.empty() || !wordInfo.reading.empty()) return;
         }
         wordLoading = true;
         if (wordJob.running) { wordJob.hasPending = true; wordJob.pendingWord = wordKey; wordJob.pendingSentence = sentence; return; }
         startWordJob(wordKey, sentence);
+    }
+
+    // 오프라인 사전으로 단어 정보 만들기 (문장 속 위치의 형태소를 찾아 기본형 · 읽기 · 품사 · 영어 뜻)
+    WordMeaning dictWord(const std::string& word, const std::string& sentence) {
+        WordMeaning w;
+        JaMorph found;
+        bool have = false;
+        for (const auto& m : jaDict.tokenize(sentence)) if (m.surface == word) { found = m; have = true; break; }
+        if (!have) {
+            auto ms = jaDict.tokenize(word);
+            if (ms.size() == 1) { found = ms[0]; have = true; }
+        }
+        std::string base = have ? found.base : word;
+        std::string readingHint = have && found.base == found.surface ? found.reading : "";
+        auto glosses = jaDict.lookup(base, readingHint, have ? found.pos : "", 3);
+        w.word = base;
+        if (have) {
+            w.reading = found.reading;
+            w.korean = JaDict::korean(found);
+            w.pos = JaDict::posKorean(found.pos);
+        }
+        if (!glosses.empty()) {
+            const JaGloss& g = glosses[0];
+            if (w.reading.empty()) { w.reading = g.reading; w.korean = jp::kanaToKorean(g.reading); }
+            std::string jm = JaDict::jmPosKorean(g.pos);
+            if (!jm.empty() && w.pos.find(jm) == std::string::npos) w.pos = w.pos.empty() ? jm : w.pos + " · " + jm;
+            for (size_t i = 0; i < g.senses.size() && i < 3; ++i) { if (!w.meaning.empty()) w.meaning += "\n"; w.meaning += std::to_string(i + 1) + ". " + g.senses[i]; }
+            if (have && found.base != found.surface) w.contextMeaning = "문장에서는 \"" + found.surface + "\" 로 활용된 형태 (" + w.pos + ")";
+        } else if (have && isFunctionWord(found.pos)) {
+            w.meaning = JaDict::posKorean(found.pos);
+        }
+        w.provider = "사전";
+        w.model = "IPADIC · JMdict";
+        return w;
+    }
+
+    void requestWordAi() {
+        if (!llm.ready() || wordKey.empty()) return;
+        wordLoading = true;
+        wordErr.clear();
+        if (wordJob.running) { wordJob.hasPending = true; wordJob.pendingWord = wordKey; wordJob.pendingSentence = wordSentence; return; }
+        startWordJob(wordKey, wordSentence);
     }
 
     void startWordJob(const std::string& key, const std::string& sentence) {
@@ -2036,12 +2188,15 @@ struct App {
                 if (readingInProgress(current)) {
                     ImGui::TextColored(ImVec4(1, 0.8f, 0.3f, 1), "AI 로 읽기를 만드는 중...");
                 } else {
+                    bool dictBusy; { std::lock_guard<std::mutex> lock(dictLoader.m); dictBusy = dictLoader.busy; }
+                    if (dictBusy) ImGui::TextColored(ImVec4(1, 0.8f, 0.3f, 1), "일본어 사전 준비 중...");
+                    else if (ImGui::SmallButton(JaDict::installed() ? "일본어 사전 로드" : "일본어 사전 받기 (오프라인, 권장)")) startDictLoad(!JaDict::installed());
+                    ImGui::SameLine();
                     ImGui::BeginDisabled(!llm.ready());
-                    if (ImGui::SmallButton("이 문장 읽기 만들기 (AI)")) { readingRequested.insert(current); requestReadings({current}); }
+                    if (ImGui::SmallButton("이 문장만 AI 로")) { readingRequested.insert(current); requestReadings({current}); }
                     ImGui::EndDisabled();
                     ImGui::SameLine();
-                    ImGui::TextDisabled("%s", llm.ready() ? "지금은 가나만 변환한 상태입니다. 한자 읽기와 정확한 단어 분할은 AI 로 만듭니다 (문장당 호출 1회, 저장되어 다시 쓰지 않음)"
-                                                          : "지금은 가나만 변환한 상태입니다. AI 설정에서 API 키를 넣으면 한자 읽기를 만들 수 있습니다");
+                    ImGui::TextDisabled("지금은 가나만 변환한 상태입니다. 사전(약 %dMB, 한 번만)을 받으면 AI 없이 단어 분할 · 한자 읽기 · 뜻이 나옵니다", JaDict::packSizeMB());
                 }
             } else {
                 ImGui::SameLine(0, 12);
@@ -2147,7 +2302,8 @@ struct App {
             if (ImGui::SmallButton("AI 설정 열기")) { showSettings = true; ImGui::CloseCurrentPopup(); }
         } else if (!wordLoading && w.provider == "사전") {
             ImGui::SameLine();
-            if (ImGui::SmallButton("AI 로 다시 찾기")) { db.setWordMeaning(wordKey, wordSentence, ""); lookupWord(wordQuery, wordSentence); }
+            if (ImGui::SmallButton(curLang() == Lang::Ja ? "AI 로 한국어 설명" : "AI 로 다시 찾기")) requestWordAi();
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip("AI 를 한 번 호출합니다 (토큰 사용). 결과는 저장되어 같은 단어를 다시 누르면 재사용합니다.");
         }
         if (!w.provider.empty()) {
             ImGui::SameLine();
@@ -2503,6 +2659,7 @@ struct App {
         else if (cmd == "quiz_answer") { std::string rest; std::getline(ss, rest); snprintf(quizBuf, sizeof quizBuf, "%s", (arg + rest).c_str()); checkQuiz(); }
         else if (cmd == "quiz_reveal") quizRevealed = true;
         else if (cmd == "lang") setUiLang(langFromCode(arg));
+        else if (cmd == "dict") startDictLoad(!JaDict::installed());  // 일본어 사전 받기/로드
         else if (cmd == "word" && valid(current)) {  // word <k>: 현재 문장의 k 번째 단어를 클릭한 것처럼
             std::vector<std::string> ws; std::istringstream ws_(seg(current).text); for (std::string w; ws_ >> w;) ws.push_back(w);
             int k = std::clamp(std::atoi(arg.c_str()), 0, (int)ws.size() - 1);
@@ -2522,7 +2679,7 @@ struct App {
                 scoring = true;
                 haveScore = false;
                 scoreSeg = current;
-                scoreJob.start(&sttCur(), 0, seg(current).text, myRec, video.lang);
+                scoreJob.start(&sttCur(), 0, seg(current).text, myRec, video.lang, jaReady ? &jaDict : nullptr);
             }
         }
         else if (cmd == "review") startSession();
@@ -2585,10 +2742,22 @@ struct App {
         } else {
             ImGui::TextColored(ImVec4(0.5f, 0.9f, 0.5f, 1), "%s STT 준비됨", langName(sl));
         }
+        if (sl == Lang::Ja) {
+            ImGui::SameLine(0, 16);
+            bool dictBusy; std::string dictStatus;
+            { std::lock_guard<std::mutex> lock(dictLoader.m); dictBusy = dictLoader.busy; dictStatus = dictLoader.status; }
+            if (jaReady) ImGui::TextColored(ImVec4(0.5f, 0.9f, 0.5f, 1), "일본어 사전 준비됨");
+            else if (dictBusy) ImGui::TextColored(ImVec4(1, 0.8f, 0.3f, 1), "%s", dictStatus.c_str());
+            else {
+                char b[128];
+                snprintf(b, sizeof b, JaDict::installed() ? "일본어 사전 로드" : "일본어 사전 받기 (%dMB, 단어 분할/읽기/뜻)", JaDict::packSizeMB());
+                if (ImGui::Button(b)) startDictLoad(!JaDict::installed());
+            }
+        }
         ImGui::SameLine(0, 16);
         if (busy) ImGui::TextColored(ImVec4(1, 0.8f, 0.3f, 1), "%s", status.c_str());
         else if (!message.empty()) {
-            const bool info = message.rfind("복사됨", 0) == 0 || message.rfind("표현 노트에 저장", 0) == 0;
+            const bool info = message.rfind("복사됨", 0) == 0 || message.rfind("표현 노트에 저장", 0) == 0 || message.rfind("일본어 사전 준비 완료", 0) == 0;
             ImGui::TextColored(info ? ImVec4(0.5f, 0.9f, 0.5f, 1) : ImVec4(1, 0.4f, 0.4f, 1), "%s", message.c_str());
         }
         else if (loaded) ImGui::TextDisabled("%s", video.title.c_str());
@@ -2794,6 +2963,7 @@ int main(int argc, char** argv) {
     app.applyAudioSettings();
     for (Lang l : {Lang::En, Lang::Ja})
         if (fs::exists(Stt::modelPath(l))) app.sttLoaderFor(l).start(&app.sttFor(l), false, l);
+    if (JaDict::installed()) app.startDictLoad(false);
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
         if (a == "--script" && i + 1 < argc) {
