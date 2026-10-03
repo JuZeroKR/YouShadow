@@ -29,6 +29,7 @@ Paste a link and it downloads the video with English subtitles, splits them into
   - The AI is never called automatically; [AI 로 한국어 설명] in the word popup makes one call and stores the result. [이 문장만 AI 로] exists as a fallback when the dictionary is not installed
   - Scoring uses the multilingual whisper small model (466MB), converting both the original and the recognised text to kana readings before comparing, so kanji/kana spelling differences do not count as errors
   - Spoken pronunciation uses a Japanese voice when present (Windows: Settings > Add voices > Japanese; macOS has Kyoko built in); otherwise the Korean voice reads the Korean transliteration
+  - Untick [읽기·발음 표시] (shortcut P) to hide every reading/pronunciation hint — under the tokens, the reading lines, under the subtitle, and in the sentence list — so you can practise reading the kanji yourself; clicking a word still reveals it in the popup
 - **Sentence splitting**: word timestamps are split into sentences by punctuation, silence, and length (Japanese: 。！？ and character count)
 - **Playback**: video via libmpv. Click a sentence to play it, loop, 0.5x–1.5x speed (pitch preserved), current sentence highlighted during free playback
 - **Practice modes**

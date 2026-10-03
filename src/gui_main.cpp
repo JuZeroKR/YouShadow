@@ -1534,7 +1534,7 @@ struct App {
             ImVec2 textSize = ImGui::CalcTextSize(s.text.c_str(), nullptr, false, wrap);
             // 일본어: AI 읽기가 있으면 한국어 발음을 한 줄 더 보여 준다
             const JaReading* rowRead = nullptr;
-            if (video.lang == Lang::Ja && (jaReady || readings.count(i))) { const JaReading& rr = readingFor(i); if (!rr.pronunciation.empty()) rowRead = &rr; }
+            if (video.lang == Lang::Ja && showPron && (jaReady || readings.count(i))) { const JaReading& rr = readingFor(i); if (!rr.pronunciation.empty()) rowRead = &rr; }
             ImVec2 pronSize = rowRead ? ImGui::CalcTextSize(rowRead->pronunciation.c_str(), nullptr, false, wrap) : ImVec2(0, 0);
             float h = ImGui::GetTextLineHeight() + textSize.y + pronSize.y + 6;
             bool selected = (i == current);
@@ -2085,6 +2085,12 @@ struct App {
         ImGui::SameLine();
         if (ImGui::SmallButton("문장 복사")) copyText(sentence);
         ImGui::SameLine();
+        if (video.lang == Lang::Ja) {
+            // 직접 읽는 연습을 할 수 있게 읽기 · 발음을 통째로 숨길 수 있다 (단어 아래 발음, 읽기/발음 줄, 자막 아래 발음, 문장 목록)
+            if (ImGui::Checkbox("읽기·발음 표시 (P)", &showPron)) db.setSetting("ja.showPron", showPron ? "1" : "0");
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip("끄면 한자를 직접 읽는 연습을 할 수 있습니다. 단어를 클릭하면 팝업에서는 읽기와 발음을 볼 수 있습니다.");
+            ImGui::SameLine();
+        }
         ImGui::TextDisabled("단어 클릭: 발음과 뜻  |  드래그: 복사");
 
         // 영어: 띄어쓰기 단위. 일본어: AI(또는 간이) 토큰 단위, 버튼 아래 줄에 한국어 발음.
@@ -2095,7 +2101,7 @@ struct App {
             rd = &readingFor(current);
             for (const auto& t : rd->tokens) {
                 words.push_back(t.surface);
-                labels.push_back(t.korean.empty() ? t.surface : t.surface + "\n" + t.korean);
+                labels.push_back((t.korean.empty() || !showPron) ? t.surface : t.surface + "\n" + t.korean);
             }
         } else {
             std::istringstream ss(sentence);
@@ -2170,8 +2176,8 @@ struct App {
             openWord(words[clicked], sentence, ImVec2(rects[clicked].first.x, rects[clicked].second.y + 4 * uiScale));
         }
 
-        // 일본어: 문장 전체 읽기와 한국어 발음
-        if (ja && rd) {
+        // 일본어: 문장 전체 읽기와 한국어 발음 (읽기 연습 중에는 숨긴다)
+        if (ja && rd && showPron) {
             if (!rd->reading.empty()) {
                 ImGui::TextDisabled("읽기:");
                 ImGui::SameLine();
@@ -2202,7 +2208,9 @@ struct App {
                 ImGui::SameLine(0, 12);
                 ImGui::TextDisabled("%s · %s", rd->provider.c_str(), rd->model.c_str());
             }
-            if (ImGui::Checkbox("자막 아래 발음 표시", &showPron)) db.setSetting("ja.showPron", showPron ? "1" : "0");
+        }
+        if (ja && rd && !showPron) {
+            ImGui::TextDisabled("읽기 연습 중: 읽기와 발음을 숨겼습니다. 확인하려면 [읽기·발음 표시] 를 켜거나 P 키, 또는 단어를 클릭하세요.");
         }
 
         // 단어 뜻 팝업
@@ -2475,7 +2483,7 @@ struct App {
         for (const auto& v : library) practicedTotal += v.practicedSegs;
         ImGui::Text("영상 %d개   연습한 문장 %d개   총 연습 %d회", (int)library.size(), practicedTotal, totalCount);
         ImGui::Spacing();
-        ImGui::TextDisabled("단축키: Space 재생/정지, ← → 문장 이동, S 쉐도잉, E 따라말하기, T 녹음, B 북마크");
+        ImGui::TextDisabled("단축키: Space 재생/정지, ← → 문장 이동, S 쉐도잉, E 따라말하기, T 녹음, B 북마크, P 읽기·발음 숨기기(일본어)");
         ImGui::EndChild();
     }
 
@@ -2634,6 +2642,7 @@ struct App {
         if (ImGui::IsKeyPressed(ImGuiKey_E, false) && valid(current) && !recording()) startEcho(current);
         if (ImGui::IsKeyPressed(ImGuiKey_T, false) && valid(current) && !recording()) startRecordOnly(current);
         if (ImGui::IsKeyPressed(ImGuiKey_B, false) && valid(current)) toggleBookmark(current);
+        if (ImGui::IsKeyPressed(ImGuiKey_P, false) && loaded && video.lang == Lang::Ja) { showPron = !showPron; db.setSetting("ja.showPron", showPron ? "1" : "0"); }
     }
 
     // --script 파일의 명령을 한 줄씩 실행 (테스트용): load <id> / wait <sec> / play <n> / echo <n> / record / stop / quit
@@ -2660,6 +2669,7 @@ struct App {
         else if (cmd == "quiz_reveal") quizRevealed = true;
         else if (cmd == "lang") setUiLang(langFromCode(arg));
         else if (cmd == "dict") startDictLoad(!JaDict::installed());  // 일본어 사전 받기/로드
+        else if (cmd == "pron") { showPron = arg != "0"; db.setSetting("ja.showPron", showPron ? "1" : "0"); }
         else if (cmd == "word" && valid(current)) {  // word <k>: 현재 문장의 k 번째 단어를 클릭한 것처럼
             std::vector<std::string> ws; std::istringstream ws_(seg(current).text); for (std::string w; ws_ >> w;) ws.push_back(w);
             int k = std::clamp(std::atoi(arg.c_str()), 0, (int)ws.size() - 1);
