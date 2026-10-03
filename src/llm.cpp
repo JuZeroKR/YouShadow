@@ -1,6 +1,8 @@
 #include "llm.h"
 
 #include <algorithm>
+#include <cctype>
+#include <cstdio>
 
 #include "http.h"
 #include "json.hpp"
@@ -253,4 +255,156 @@ Explanation explainSentence(const LlmConfig& cfg, const std::string& sentence,
     ex.provider = providerName(cfg.provider);
     ex.model = cfg.model(cfg.provider);
     return ex;
+}
+
+// ---------------- 단어 뜻 ----------------
+
+std::string WordMeaning::toJson() const {
+    json j;
+    j["word"] = word;
+    j["ipa"] = ipa;
+    j["pos"] = pos;
+    j["meaning"] = meaning;
+    j["context"] = contextMeaning;
+    j["example"] = example;
+    j["provider"] = provider;
+    j["model"] = model;
+    return j.dump();
+}
+
+WordMeaning WordMeaning::fromJson(const std::string& s) {
+    WordMeaning w;
+    try {
+        json j = json::parse(s);
+        auto str = [&](const char* k) { return j.contains(k) && j[k].is_string() ? j[k].get<std::string>() : std::string(); };
+        w.word = str("word");
+        w.ipa = str("ipa");
+        w.pos = str("pos");
+        w.meaning = str("meaning");
+        w.contextMeaning = str("context");
+        w.example = str("example");
+        w.provider = str("provider");
+        w.model = str("model");
+    } catch (...) {}
+    return w;
+}
+
+static const char* kWordPrompt =
+    "You are an English tutor helping a Korean learner. The learner clicked one word in a sentence from a YouTube video. "
+    "Respond with ONLY a JSON object, no markdown, in this exact shape:\n"
+    "{\"word\": \"기본형 (예: running → run, 고유명사나 구어 축약형은 그대로)\", "
+    "\"ipa\": \"미국식 발음 기호, 모르면 빈 문자열\", "
+    "\"pos\": \"품사를 한국어로 (명사/동사/형용사/부사/전치사/감탄사 등)\", "
+    "\"meaning\": \"대표적인 뜻을 한국어로, 쉼표로 구분한 2~4개\", "
+    "\"context\": \"이 문장에서는 어떤 뜻으로 쓰였는지 한국어로 1~2문장. 구동사나 숙어의 일부라면 그 표현 전체를 알려줄 것\", "
+    "\"example\": \"그 단어를 같은 뜻으로 쓴 짧은 영어 예문 하나\"}\n"
+    "Write meaning/context in Korean; keep word/example in English. Be concise.";
+
+WordMeaning explainWord(const LlmConfig& cfg, const std::string& word, const std::string& sentence, std::string* err) {
+    std::string user = "Sentence: " + sentence + "\nClicked word: " + word;
+    std::string text = llmComplete(cfg, kWordPrompt, user, err);
+    WordMeaning w;
+    if (text.empty()) return w;
+    w = WordMeaning::fromJson(extractJson(text));
+    if (w.empty()) {
+        if (err) *err = "단어 뜻 형식을 읽지 못했습니다: " + text.substr(0, 200);
+        return w;
+    }
+    if (w.word.empty()) w.word = word;
+    w.provider = providerName(cfg.provider);
+    w.model = cfg.model(cfg.provider);
+    return w;
+}
+
+// Wiktionary 정의의 HTML 을 평문으로 (태그 제거, 기본 엔티티 해제, 공백 정리)
+static std::string htmlToText(std::string html) {
+    // <style>…</style> 는 내용까지 통째로 지운다 (Wiktionary 정의에 CSS 가 섞여 온다)
+    for (size_t a; (a = html.find("<style")) != std::string::npos;) {
+        size_t b = html.find("</style>", a);
+        html.erase(a, b == std::string::npos ? std::string::npos : b + 8 - a);
+    }
+    std::string out;
+    bool inTag = false;
+    for (size_t i = 0; i < html.size(); ++i) {
+        char c = html[i];
+        if (c == '<') { inTag = true; continue; }
+        if (c == '>') { inTag = false; continue; }
+        if (inTag) continue;
+        if (c == '&') {
+            size_t semi = html.find(';', i);
+            if (semi != std::string::npos && semi - i <= 7) {
+                std::string ent = html.substr(i + 1, semi - i - 1);
+                const char* rep = ent == "amp" ? "&" : ent == "lt" ? "<" : ent == "gt" ? ">" : ent == "quot" ? "\"" :
+                                  (ent == "#39" || ent == "apos") ? "'" : ent == "nbsp" ? " " : nullptr;
+                if (rep) { out += rep; i = semi; continue; }
+            }
+        }
+        out += c;
+    }
+    // 공백 정리
+    std::string s;
+    bool space = true;
+    for (char c : out) {
+        if (std::isspace((unsigned char)c)) { if (!space) s += ' '; space = true; }
+        else { s += c; space = false; }
+    }
+    while (!s.empty() && s.back() == ' ') s.pop_back();
+    return s;
+}
+
+WordMeaning lookupDictionary(const std::string& word, std::string* err) {
+    // Wiktionary (영어) 정의 API. 소문자로 먼저 찾고, 없으면 원래 표기로 다시 찾는다.
+    auto fetch = [&](const std::string& w, std::string* e) {
+        std::string enc;
+        for (unsigned char c : w) {
+            if (std::isalnum(c) || c == '-' || c == '\'' || c == '_') enc += (char)c;
+            else { char buf[4]; snprintf(buf, sizeof buf, "%%%02X", c); enc += buf; }
+        }
+        return httpRequest("GET", "https://en.wiktionary.org/api/rest_v1/page/definition/" + enc,
+                           {{"Accept", "application/json"}}, "", e, 15);
+    };
+    std::string lower = word;
+    std::transform(lower.begin(), lower.end(), lower.begin(), [](unsigned char c) { return (char)std::tolower(c); });
+    std::string e;
+    HttpResponse r = fetch(lower, &e);
+    if (r.status == 404 && lower != word) r = fetch(word, &e);
+    WordMeaning w;
+    if (r.status == 0) { if (err) *err = "사전 요청 실패: " + e; return w; }
+    if (r.status == 404) { if (err) *err = "사전에 없는 단어입니다: " + word; return w; }
+    if (r.status != 200) { if (err) *err = "사전 응답 오류 (HTTP " + std::to_string(r.status) + ")"; return w; }
+    try {
+        json j = json::parse(r.body);
+        if (!j.contains("en") || !j["en"].is_array()) throw std::runtime_error("no english entry");
+        std::string meanings;
+        int nPos = 0, nTotal = 0;
+        for (const auto& entry : j["en"]) {
+            if (nTotal >= 5) break;
+            std::string pos = entry.value("partOfSpeech", "");
+            if (!entry.contains("definitions") || !entry["definitions"].is_array()) continue;
+            int nDef = 0;
+            for (const auto& d : entry["definitions"]) {
+                std::string text = htmlToText(d.value("definition", ""));
+                if (text.empty()) continue;
+                // Wiktionary 는 중첩된 하위 뜻을 별도 정의로도 한 번 더 주므로 이미 포함된 문장은 건너뛴다
+                if (meanings.find(text) != std::string::npos) continue;
+                if (text.size() > 160) text = text.substr(0, 157) + "...";
+                if (!meanings.empty()) meanings += "\n";
+                meanings += "(" + pos + ") " + text;
+                if (w.example.empty() && d.contains("examples") && d["examples"].is_array() && !d["examples"].empty())
+                    w.example = htmlToText(d["examples"][0].get<std::string>());
+                ++nTotal;
+                if (++nDef >= 2 || nTotal >= 5) break;
+            }
+            if (nDef > 0) { if (w.pos.empty()) w.pos = pos; if (++nPos >= 3) break; }
+        }
+        w.word = lower;
+        w.meaning = meanings;
+        w.provider = "사전";
+        w.model = "Wiktionary";
+    } catch (...) {
+        if (err) *err = "사전 응답을 읽지 못했습니다";
+        return WordMeaning();
+    }
+    if (w.empty() && err) *err = "사전에 영어 정의가 없습니다: " + word;
+    return w;
 }

@@ -46,3 +46,24 @@ struct Explanation {
 // 앞뒤 문장을 문맥으로 주고 현재 문장을 해설한다.
 Explanation explainSentence(const LlmConfig& cfg, const std::string& sentence,
                             const std::string& before, const std::string& after, std::string* err);
+
+// ---- 단어 뜻 ----
+struct WordMeaning {
+    std::string word;            // 기본형 (예: "running" → "run")
+    std::string ipa;             // 발음 기호 (없으면 빈 문자열)
+    std::string pos;             // 품사
+    std::string meaning;         // 대표 뜻 (한국어, 사전 폴백이면 영어)
+    std::string contextMeaning;  // 이 문장에서의 뜻 / 쓰임
+    std::string example;         // 예문
+    std::string provider, model; // 출처 (AI 공급자 또는 "사전")
+
+    bool empty() const { return meaning.empty() && contextMeaning.empty(); }
+    std::string toJson() const;
+    static WordMeaning fromJson(const std::string& json);
+};
+
+// AI 로 문장 속 단어의 뜻을 묻는다 (한국어 설명).
+WordMeaning explainWord(const LlmConfig& cfg, const std::string& word, const std::string& sentence, std::string* err);
+
+// API 키가 없을 때의 폴백: Wiktionary(영어) 에서 영어 정의를 가져온다.
+WordMeaning lookupDictionary(const std::string& word, std::string* err);

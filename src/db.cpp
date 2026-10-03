@@ -62,6 +62,8 @@ CREATE TABLE IF NOT EXISTS expressions(
   text TEXT, meaning TEXT, note TEXT, example TEXT, created_at TEXT,
   ease REAL DEFAULT 2.5, interval_days REAL DEFAULT 0, due_at TEXT, reviews INTEGER DEFAULT 0, lapses INTEGER DEFAULT 0);
 CREATE INDEX IF NOT EXISTS idx_expr_due ON expressions(due_at);
+CREATE TABLE IF NOT EXISTS word_meanings(
+  word TEXT, sentence TEXT, json TEXT, created_at TEXT, PRIMARY KEY(word, sentence));
 )";
 
 const char* kReviewSelect =
@@ -350,6 +352,17 @@ std::string Db::getExplanation(const std::string& videoId, int segIdx) const {
 void Db::setExplanation(const std::string& videoId, int segIdx, const std::string& json) {
     Stmt(db_, "INSERT OR REPLACE INTO explanations(video_id, seg_idx, json, created_at) VALUES(?,?,?,?)")
         .bind(1, videoId).bind(2, segIdx).bind(3, json).bind(4, now()).run();
+}
+
+std::string Db::getWordMeaning(const std::string& word, const std::string& sentence) const {
+    Stmt st(db_, "SELECT json FROM word_meanings WHERE word=? AND sentence=?");
+    st.bind(1, word).bind(2, sentence);
+    return st.step() ? st.colText(0) : "";
+}
+
+void Db::setWordMeaning(const std::string& word, const std::string& sentence, const std::string& json) {
+    Stmt(db_, "INSERT OR REPLACE INTO word_meanings(word, sentence, json, created_at) VALUES(?,?,?,?)")
+        .bind(1, word).bind(2, sentence).bind(3, json).bind(4, now()).run();
 }
 
 std::set<int> Db::explainedSegments(const std::string& videoId) const {

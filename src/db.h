@@ -123,6 +123,10 @@ public:
     void setExplanation(const std::string& videoId, int segIdx, const std::string& json);
     std::set<int> explainedSegments(const std::string& videoId) const;
 
+    // 단어 뜻 캐시 (단어 + 문장 기준, JSON)
+    std::string getWordMeaning(const std::string& word, const std::string& sentence) const;
+    void setWordMeaning(const std::string& word, const std::string& sentence, const std::string& json);
+
     // 표현 카드 (간격 반복 포함)
     long long addExpression(const std::string& videoId, int segIdx, const std::string& text,
                             const std::string& meaning, const std::string& note, const std::string& example);

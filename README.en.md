@@ -16,6 +16,8 @@ Paste a link and it downloads the video with English subtitles, splits them into
 
 ![Scoring](docs/scoring.png)
 
+![Word meaning](docs/word.png)
+
 ## Features
 
 - **Load a video**: YouTube URL → yt-dlp downloads a 720p video and English subtitles (json3). If there are no subtitles, or YouTube blocks the subtitle request, a transcript is generated with whisper.cpp
@@ -43,7 +45,8 @@ Paste a link and it downloads the video with English subtitles, splits them into
   - Review sessions: one click on [복습 시작] walks you through everything that is due
 - **Waveforms**: the original sentence and your recording side by side
 - **Volume**: separate video and recording-playback volume (remembered)
-- **Word pronunciation**: the current sentence expands into word buttons; click one and the system speech synthesizer (an English voice) pronounces it. Also whole-sentence and slow playback, plus [듣기] buttons in the expressions tab and review cards. Offline, nothing to install
+- **Word pronunciation and meaning**: the current sentence expands into word buttons; click one and the system speech synthesizer (an English voice) pronounces it while a meaning popup opens. With an AI key you get the base form, IPA, part of speech, Korean meaning, how it is used in this sentence, and an example; without one, English definitions from Wiktionary. Save straight to the expression notes from the popup. Also whole-sentence and slow playback, plus [듣기] buttons in the expressions tab and review cards. Pronunciation is offline, nothing to install
+- **Copy sentences**: drag across the word buttons to copy that range to the clipboard, or use [문장 복사] to copy the whole sentence
 
 ## Download (for users)
 

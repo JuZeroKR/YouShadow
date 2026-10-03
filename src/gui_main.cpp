@@ -337,6 +337,34 @@ struct App {
     bool cardsDirty = true;
     bool cardRevealed = false;  // 복습 세션에서 표현 카드 뜻 보기
 
+    // ---- 단어 뜻 (클릭한 단어) ----
+    struct WordJob {
+        std::thread th;
+        std::mutex m;
+        bool running = false, done = false;
+        std::string word, sentence;          // 진행 중인 요청
+        WordMeaning result;
+        std::string err;
+        bool hasPending = false;             // 진행 중에 다른 단어를 클릭하면 끝난 뒤 이어서 찾는다
+        std::string pendingWord, pendingSentence;
+        ~WordJob() { if (th.joinable()) th.join(); }
+    } wordJob;
+    std::string wordQuery, wordKey, wordSentence;  // 팝업에 표시 중인 단어 (원문 / 소문자 키 / 문장)
+    WordMeaning wordInfo;
+    std::string wordErr;
+    bool wordLoading = false;
+    ImVec2 wordPopupPos;
+
+    // 단어 드래그 선택 (복사)
+    struct WordDrag {
+        int anchor = -1;          // 마우스를 누른 단어 (-1: 없음)
+        int a = -1, b = -1;       // 선택 범위
+        bool dragging = false;
+        ImVec2 pressPos;
+        Clock::time_point copiedAt;
+    } wordDrag;
+    int scriptWordClick = -1;  // --script 의 word 명령: 다음 프레임에 이 단어를 클릭한 것으로 처리
+
     // ---- 문장 학습 (리스닝 받아쓰기 / 영작) ----
     int quizKind = 0;            // 0: 리스닝(자막 없이 받아쓰기), 1: 영작(한국어 → 영어)
     int quizSeg = -1;            // 출제 중인 문장 (-1: 없음)
@@ -950,6 +978,22 @@ struct App {
             if (!explainJob.running && !explainJob.err.empty()) { message = "해설 실패: " + explainJob.err; explainJob.err.clear(); }
         }
         // 채점
+        // 단어 뜻 결과 수거
+        {
+            std::lock_guard<std::mutex> lock(wordJob.m);
+            if (wordJob.done) {
+                wordJob.done = false;
+                wordJob.running = false;
+                // AI 결과만 캐시한다 (사전은 빠르고 무료라 매번 새로 받는다)
+                if (!wordJob.result.empty() && wordJob.result.provider != "사전") db.setWordMeaning(wordJob.word, wordJob.sentence, wordJob.result.toJson());
+                if (wordJob.word == wordKey && wordJob.sentence == wordSentence) {
+                    wordInfo = wordJob.result;
+                    wordErr = wordJob.err;
+                    wordLoading = false;
+                }
+                if (wordJob.hasPending) startWordJob(wordJob.pendingWord, wordJob.pendingSentence);
+            }
+        }
         {
             std::lock_guard<std::mutex> lock(scoreJob.m);
             if (scoreJob.done) {
@@ -1496,28 +1540,251 @@ struct App {
         ImGui::EndChild();
     }
 
-    // 현재 문장을 단어 버튼으로 펼친다. 클릭하면 그 단어의 발음이 나온다.
+    // ---------------- 단어 행: 클릭 = 발음 + 뜻, 드래그 = 복사 ----------------
+
+    static std::string lowerAscii(std::string s) {
+        for (auto& c : s) c = (char)std::tolower((unsigned char)c);
+        return s;
+    }
+
+    void copyText(const std::string& text) {
+        if (text.empty()) return;
+        ImGui::SetClipboardText(text.c_str());
+        message = "복사됨: " + (text.size() > 60 ? text.substr(0, 60) + "..." : text);
+        wordDrag.copiedAt = Clock::now();
+    }
+
+    // 마우스 위치에서 가장 가까운 단어 (같은 줄 우선)
+    static int nearestWord(const std::vector<std::pair<ImVec2, ImVec2>>& rects, ImVec2 p) {
+        int best = -1;
+        float bestD = 1e30f;
+        for (size_t i = 0; i < rects.size(); ++i) {
+            const auto& [a, b] = rects[i];
+            float dx = p.x < a.x ? a.x - p.x : p.x > b.x ? p.x - b.x : 0.0f;
+            float dy = p.y < a.y ? a.y - p.y : p.y > b.y ? p.y - b.y : 0.0f;
+            float d = dy * 1000.0f + dx;
+            if (d < bestD) { bestD = d; best = (int)i; }
+        }
+        return best;
+    }
+
+    // 단어 뜻 찾기: 캐시 → AI(키가 있으면) → 무료 영어 사전
+    void lookupWord(const std::string& word, const std::string& sentence) {
+        wordQuery = word;
+        wordKey = lowerAscii(word);
+        wordSentence = sentence;
+        wordErr.clear();
+        wordInfo = WordMeaning();
+        wordLoading = false;
+        std::string cached = db.getWordMeaning(wordKey, sentence);
+        if (!cached.empty()) {
+            WordMeaning c = WordMeaning::fromJson(cached);
+            // 사전 결과만 있는데 지금은 AI 를 쓸 수 있으면 다시 찾는다
+            if (!c.empty() && !(c.provider == "사전" && llm.ready())) { wordInfo = c; return; }
+        }
+        wordLoading = true;
+        if (wordJob.running) { wordJob.hasPending = true; wordJob.pendingWord = wordKey; wordJob.pendingSentence = sentence; return; }
+        startWordJob(wordKey, sentence);
+    }
+
+    void startWordJob(const std::string& key, const std::string& sentence) {
+        if (wordJob.th.joinable()) wordJob.th.join();
+        wordJob.running = true; wordJob.done = false; wordJob.hasPending = false;
+        wordJob.word = key; wordJob.sentence = sentence;
+        LlmConfig cfg = llm;
+        wordJob.th = std::thread([this, cfg, key, sentence] {
+            std::string e;
+            WordMeaning r;
+            if (cfg.ready()) {
+                r = explainWord(cfg, key, sentence, &e);
+                if (r.empty()) {  // AI 실패 → 사전으로 대체 (오류는 함께 보여 준다)
+                    std::string e2;
+                    WordMeaning d = lookupDictionary(key, &e2);
+                    if (!d.empty()) r = d;
+                }
+            } else {
+                r = lookupDictionary(key, &e);
+            }
+            std::lock_guard<std::mutex> lock(wordJob.m);
+            wordJob.result = r; wordJob.err = e; wordJob.done = true;
+        });
+    }
+
     void drawWordRow() {
-        if (quizHidden()) { ImGui::TextDisabled("발음: 문장 학습 문제 진행 중이라 단어를 숨깁니다"); return; }
-        if (!valid(current)) { ImGui::TextDisabled("발음: 문장을 선택하면 단어를 클릭해 발음을 들을 수 있습니다"); return; }
-        if (!tts.available()) { ImGui::TextDisabled("발음: 이 PC 에 음성 합성 엔진이 없어 단어 발음을 들려줄 수 없습니다"); return; }
-        ImGui::TextDisabled("발음:");
+        if (quizHidden()) { ImGui::TextDisabled("단어: 문장 학습 문제 진행 중이라 단어를 숨깁니다"); return; }
+        if (!valid(current)) { ImGui::TextDisabled("단어: 문장을 선택하면 단어를 클릭해 발음과 뜻을 보고, 드래그해서 복사할 수 있습니다"); return; }
+        const std::string sentence = seg(current).text;
+
+        ImGui::TextDisabled("단어:");
         ImGui::SameLine();
-        if (ImGui::SmallButton("문장 듣기")) speak(seg(current).text);
+        ImGui::BeginDisabled(!tts.available());
+        if (ImGui::SmallButton("문장 듣기")) speak(sentence);
         ImGui::SameLine();
         if (ImGui::Checkbox("천천히", &ttsSlow)) db.setSetting("tts.slow", ttsSlow ? "1" : "0");
-        if (ImGui::IsItemHovered()) ImGui::SetTooltip("음성: %s", tts.voiceName().c_str());
+        ImGui::EndDisabled();
+        if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) {
+            if (tts.available()) ImGui::SetTooltip("음성: %s", tts.voiceName().c_str());
+            else ImGui::SetTooltip("이 PC 에 영어 음성 합성 엔진이 없어 발음을 들려줄 수 없습니다");
+        }
+        ImGui::SameLine();
+        if (ImGui::SmallButton("문장 복사")) copyText(sentence);
+        ImGui::SameLine();
+        ImGui::TextDisabled("단어 클릭: 발음과 뜻  |  드래그: 복사");
+
+        std::vector<std::string> words;
+        { std::istringstream ss(sentence); std::string w; while (ss >> w) words.push_back(w); }
+        std::vector<std::pair<ImVec2, ImVec2>> rects(words.size());
+
+        // 드래그 판정: 누른 뒤 조금 움직이면 드래그 (버튼 클릭은 무시)
+        const bool mouseDown = ImGui::IsMouseDown(ImGuiMouseButton_Left);
+        if (wordDrag.anchor >= 0 && mouseDown && !wordDrag.dragging) {
+            ImVec2 mp = ImGui::GetMousePos();
+            if (std::fabs(mp.x - wordDrag.pressPos.x) + std::fabs(mp.y - wordDrag.pressPos.y) > 6.0f * uiScale) wordDrag.dragging = true;
+        }
+
         const float lineRight = ImGui::GetWindowPos().x + ImGui::GetWindowSize().x - ImGui::GetStyle().WindowPadding.x;
         const float spacing = ImGui::GetStyle().ItemSpacing.x;
-        std::istringstream ss(seg(current).text);
-        std::string w;
-        int k = 0;
-        while (ss >> w) {
-            ImGui::PushID(k++);
-            float bw = ImGui::CalcTextSize(w.c_str()).x + ImGui::GetStyle().FramePadding.x * 2;
+        int clicked = -1;
+        for (size_t k = 0; k < words.size(); ++k) {
+            ImGui::PushID((int)k);
+            float bw = ImGui::CalcTextSize(words[k].c_str()).x + ImGui::GetStyle().FramePadding.x * 2;
             if (ImGui::GetItemRectMax().x + spacing + bw <= lineRight) ImGui::SameLine();
-            if (ImGui::SmallButton(w.c_str())) { std::string b = bareWord(w); if (!b.empty()) speak(b); }
+            bool pressed = ImGui::SmallButton(words[k].c_str());
+            rects[k] = {ImGui::GetItemRectMin(), ImGui::GetItemRectMax()};
+            if (ImGui::IsItemClicked(ImGuiMouseButton_Left)) {
+                wordDrag.anchor = (int)k;
+                wordDrag.dragging = false;
+                wordDrag.pressPos = ImGui::GetMousePos();
+                wordDrag.a = wordDrag.b = -1;
+            }
+            if (pressed && !wordDrag.dragging) clicked = (int)k;
             ImGui::PopID();
+        }
+
+        // 드래그 범위 갱신 / 놓으면 복사
+        if (wordDrag.anchor >= 0) {
+            if (wordDrag.anchor >= (int)words.size()) { wordDrag.anchor = -1; wordDrag.a = wordDrag.b = -1; }
+            else {
+                if (wordDrag.dragging) {
+                    int cur = nearestWord(rects, ImGui::GetMousePos());
+                    wordDrag.a = std::min(wordDrag.anchor, cur);
+                    wordDrag.b = std::max(wordDrag.anchor, cur);
+                }
+                if (!mouseDown) {
+                    if (wordDrag.dragging && wordDrag.a >= 0) {
+                        std::string sel;
+                        for (int i = wordDrag.a; i <= wordDrag.b; ++i) { if (i > wordDrag.a) sel += ' '; sel += words[i]; }
+                        copyText(sel);
+                    } else {
+                        wordDrag.a = wordDrag.b = -1;
+                    }
+                    wordDrag.anchor = -1;
+                    wordDrag.dragging = false;
+                }
+            }
+        }
+        // 선택 강조: 드래그 중이거나 복사 직후 잠깐
+        const bool recentlyCopied = std::chrono::duration<float>(Clock::now() - wordDrag.copiedAt).count() < 1.2f;
+        if (wordDrag.a >= 0 && wordDrag.b < (int)words.size() && (wordDrag.anchor >= 0 || recentlyCopied)) {
+            ImDrawList* dl = ImGui::GetWindowDrawList();
+            const ImU32 col = wordDrag.anchor >= 0 ? IM_COL32(90, 170, 255, 90) : IM_COL32(120, 230, 120, 90);
+            for (int i = wordDrag.a; i <= wordDrag.b; ++i) dl->AddRectFilled(rects[i].first, rects[i].second, col, 3.0f);
+        } else if (wordDrag.a >= 0 && wordDrag.anchor < 0 && !recentlyCopied) {
+            wordDrag.a = wordDrag.b = -1;
+        }
+
+        if (scriptWordClick >= 0 && scriptWordClick < (int)words.size()) { clicked = scriptWordClick; scriptWordClick = -1; }
+        if (clicked >= 0) openWord(words[clicked], sentence, ImVec2(rects[clicked].first.x, rects[clicked].second.y + 4 * uiScale));
+
+        // 단어 뜻 팝업
+        ImGui::SetNextWindowPos(wordPopupPos, ImGuiCond_Appearing);
+        ImGui::SetNextWindowSize(ImVec2(460 * uiScale, 0), ImGuiCond_Appearing);
+        if (ImGui::BeginPopup("word_popup")) {
+            drawWordPopup();
+            ImGui::EndPopup();
+        }
+    }
+
+    // 단어 클릭 처리 (스크립트에서도 사용)
+    void openWord(const std::string& rawWord, const std::string& sentence, ImVec2 pos) {
+        std::string b = bareWord(rawWord);
+        if (b.empty()) return;
+        if (tts.available()) speak(b);
+        lookupWord(b, sentence);
+        wordPopupPos = pos;
+        ImGui::OpenPopup("word_popup");
+    }
+
+    void drawWordPopup() {
+        // 화면 아래/오른쪽으로 넘치면 안쪽으로 밀어 넣는다 (크기는 자동이라 한 프레임 뒤에 맞춰진다)
+        {
+            const ImGuiViewport* vp = ImGui::GetMainViewport();
+            ImVec2 wp = ImGui::GetWindowPos(), ws = ImGui::GetWindowSize();
+            float maxX = vp->WorkPos.x + vp->WorkSize.x - 8, maxY = vp->WorkPos.y + vp->WorkSize.y - 8;
+            ImVec2 np(std::min(wp.x, maxX - ws.x), std::min(wp.y, maxY - ws.y));
+            if (np.x != wp.x || np.y != wp.y) ImGui::SetWindowPos(ImVec2(std::max(np.x, vp->WorkPos.x), std::max(np.y, vp->WorkPos.y)));
+        }
+        const WordMeaning& w = wordInfo;
+        const std::string head = w.word.empty() ? wordQuery : w.word;
+        ImGui::TextColored(ImVec4(0.6f, 0.9f, 1, 1), "%s", head.c_str());
+        if (!w.ipa.empty()) { ImGui::SameLine(); ImGui::TextDisabled("%s", w.ipa.c_str()); }
+        if (!w.pos.empty()) { ImGui::SameLine(); ImGui::TextDisabled("[%s]", w.pos.c_str()); }
+        if (!w.word.empty() && lowerAscii(w.word) != wordKey) { ImGui::SameLine(); ImGui::TextDisabled("(문장에서는 \"%s\")", wordQuery.c_str()); }
+        ImGui::Separator();
+
+        if (wordLoading) {
+            ImGui::TextColored(ImVec4(1, 0.8f, 0.3f, 1), "%s", llm.ready() ? "AI 에게 뜻을 묻는 중..." : "사전에서 찾는 중...");
+        } else {
+            if (!w.meaning.empty()) ImGui::TextWrapped("%s", w.meaning.c_str());
+            if (!w.contextMeaning.empty()) {
+                ImGui::Spacing();
+                ImGui::TextDisabled("이 문장에서");
+                ImGui::TextWrapped("%s", w.contextMeaning.c_str());
+            }
+            if (!w.example.empty()) {
+                ImGui::Spacing();
+                ImGui::TextDisabled("예문");
+                ImGui::TextWrapped("%s", w.example.c_str());
+            }
+            if (!wordErr.empty()) {
+                ImGui::Spacing();
+                ImGui::PushTextWrapPos(0);
+                ImGui::TextColored(ImVec4(1, 0.5f, 0.5f, 1), "%s", wordErr.c_str());
+                ImGui::PopTextWrapPos();
+            }
+            if (!llm.ready()) {
+                ImGui::Spacing();
+                ImGui::TextDisabled("AI 설정에서 API 키를 넣으면 한국어 뜻과 문맥 설명을 볼 수 있습니다.");
+            }
+        }
+
+        ImGui::Spacing();
+        ImGui::BeginDisabled(!tts.available());
+        if (ImGui::SmallButton("발음")) speak(wordKey);
+        ImGui::EndDisabled();
+        ImGui::SameLine();
+        if (ImGui::SmallButton("복사")) copyText(head);
+        ImGui::SameLine();
+        ImGui::BeginDisabled(wordLoading || w.empty() || !loaded || !valid(current));
+        if (ImGui::SmallButton("표현 노트에 저장")) {
+            Expression e;
+            e.text = head;
+            e.meaning = w.meaning;
+            e.note = w.contextMeaning;
+            e.example = w.example;
+            saveExpression(current, e);
+        }
+        ImGui::EndDisabled();
+        if (!llm.ready()) {
+            ImGui::SameLine();
+            if (ImGui::SmallButton("AI 설정 열기")) { showSettings = true; ImGui::CloseCurrentPopup(); }
+        } else if (!wordLoading && w.provider == "사전") {
+            ImGui::SameLine();
+            if (ImGui::SmallButton("AI 로 다시 찾기")) { db.setWordMeaning(wordKey, wordSentence, ""); lookupWord(wordQuery, wordSentence); }
+        }
+        if (!w.provider.empty()) {
+            ImGui::SameLine();
+            ImGui::TextDisabled("%s · %s", w.provider.c_str(), w.model.c_str());
         }
     }
 
@@ -1859,6 +2126,17 @@ struct App {
         else if (cmd == "quiz") startQuiz(std::max(0, current), arg == "compose" ? 1 : 0);
         else if (cmd == "quiz_answer") { std::string rest; std::getline(ss, rest); snprintf(quizBuf, sizeof quizBuf, "%s", (arg + rest).c_str()); checkQuiz(); }
         else if (cmd == "quiz_reveal") quizRevealed = true;
+        else if (cmd == "word" && valid(current)) {  // word <k>: 현재 문장의 k 번째 단어를 클릭한 것처럼
+            std::vector<std::string> ws; std::istringstream ws_(seg(current).text); for (std::string w; ws_ >> w;) ws.push_back(w);
+            int k = std::clamp(std::atoi(arg.c_str()), 0, (int)ws.size() - 1);
+            scriptWordClick = k;
+        }
+        else if (cmd == "copy" && valid(current)) {  // copy <a> <b>: 단어 a~b 를 드래그해 복사한 것처럼
+            std::vector<std::string> ws; std::istringstream ws_(seg(current).text); for (std::string w; ws_ >> w;) ws.push_back(w);
+            int a = std::clamp(std::atoi(arg.c_str()), 0, (int)ws.size() - 1), b = a; ss >> b; b = std::clamp(b, a, (int)ws.size() - 1);
+            std::string sel; for (int i = a; i <= b; ++i) { if (i > a) sel += ' '; sel += ws[i]; }
+            wordDrag.a = a; wordDrag.b = b; copyText(sel);
+        }
         else if (cmd == "rescore" && valid(current) && stt.loaded()) {
             // 현재 문장의 마지막 녹음을 다시 채점 (마이크 없이 채점 화면 확인용)
             std::string path = db.lastRecording(video.id, current);
@@ -1921,7 +2199,10 @@ struct App {
         }
         ImGui::SameLine(0, 16);
         if (busy) ImGui::TextColored(ImVec4(1, 0.8f, 0.3f, 1), "%s", status.c_str());
-        else if (!message.empty()) ImGui::TextColored(ImVec4(1, 0.4f, 0.4f, 1), "%s", message.c_str());
+        else if (!message.empty()) {
+            const bool info = message.rfind("복사됨", 0) == 0 || message.rfind("표현 노트에 저장", 0) == 0;
+            ImGui::TextColored(info ? ImVec4(0.5f, 0.9f, 0.5f, 1) : ImVec4(1, 0.4f, 0.4f, 1), "%s", message.c_str());
+        }
         else if (loaded) ImGui::TextDisabled("%s", video.title.c_str());
         else ImGui::TextDisabled(" ");  // SameLine 뒤에 항목이 없으면 다음 줄이 옆으로 붙는다
 
