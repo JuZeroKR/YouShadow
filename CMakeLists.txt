@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(YouShadow VERSION 0.5.1 LANGUAGES C CXX)
+project(YouShadow VERSION 0.5.2 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -38,6 +38,15 @@ set(GGML_OPENMP OFF CACHE BOOL "" FORCE)
 if(APPLE)
     # Windows 와 같은 CPU 경로를 쓴다 (base.en 모델은 CPU 로 충분)
     set(GGML_METAL OFF CACHE BOOL "" FORCE)
+else()
+    # 빌드한 PC 의 CPU 기능(GGML_NATIVE)을 쓰면 CI 러너에 AVX-512 가 있을 때 AVX-512 가 없는 PC(예: Core Ultra)에서
+    # 시작하자마자 0xC000001D 로 죽는다. 배포판은 AVX2 기준으로 고정한다 (2013년 이후 대부분의 x86 CPU)
+    set(GGML_NATIVE OFF CACHE BOOL "" FORCE)
+    set(GGML_AVX ON CACHE BOOL "" FORCE)
+    set(GGML_AVX2 ON CACHE BOOL "" FORCE)
+    set(GGML_FMA ON CACHE BOOL "" FORCE)
+    set(GGML_F16C ON CACHE BOOL "" FORCE)
+    set(GGML_AVX512 OFF CACHE BOOL "" FORCE)
 endif()
 add_subdirectory(${TP}/whisper.cpp EXCLUDE_FROM_ALL)
 
