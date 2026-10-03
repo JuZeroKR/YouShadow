@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(YouShadow VERSION 0.6.0 LANGUAGES C CXX)
+project(YouShadow VERSION 0.7.0 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -51,6 +51,7 @@ endif()
 
 # ---- 핵심 로직 (CLI/GUI 공용) ----
 add_library(ys_core STATIC
+    src/lang.cpp
     src/paths.cpp
     src/youtube.cpp
     src/transcript.cpp

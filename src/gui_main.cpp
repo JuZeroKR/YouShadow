@@ -57,6 +57,7 @@ constexpr int kPeakBinMs = 10;
 
 struct LoadedVideo {
     std::string id, title, dir, videoPath, audioPath;
+    Lang lang = Lang::En;
     std::vector<Segment> segs;
     std::vector<float> peaks;  // 파형용 [min,max] per 10ms
 };
@@ -77,7 +78,7 @@ struct Loader {
     // 로컬 영상을 처음 등록할 때만 채운다 (비어 있으면 data/<id>/source.txt 로 다시 연다)
     std::string localVideo, localSub;
 
-    void start(const std::string& id) {
+    void start(const std::string& id, Lang lang) {
         if (th.joinable()) th.join();
         const bool isLocal = local::isLocalId(id);
         {
@@ -89,22 +90,23 @@ struct Loader {
         const std::string lv = localVideo, ls = localSub;
         localVideo.clear();
         localSub.clear();
-        th = std::thread([this, id, isLocal, lv, ls] {
+        th = std::thread([this, id, lang, isLocal, lv, ls] {
             LoadedVideo v;
             std::string err;
             try {
                 v.id = id;
+                v.lang = lang;
                 v.dir = paths::dataDir() + "/" + id;
                 std::string subtitlePath;
                 bool json3 = false;
                 if (isLocal) {
-                    local::Prepared p = lv.empty() ? local::reopen(v.dir) : local::prepare(lv, ls, v.dir);
+                    local::Prepared p = lv.empty() ? local::reopen(v.dir, lang) : local::prepare(lv, ls, v.dir, lang);
                     v.title = p.title;
                     v.videoPath = p.videoPath;
                     v.audioPath = p.audioPath;
                     subtitlePath = p.subtitlePath;
                 } else {
-                    auto dl = yt::download(id, v.dir);
+                    auto dl = yt::download(id, v.dir, lang);
                     v.title = dl.title.empty() ? id : dl.title;
                     v.videoPath = fs::absolute(dl.videoPath).string();
                     v.audioPath = dl.audioPath;
@@ -116,8 +118,8 @@ struct Loader {
                 v.segs = transcript::load(segPath);
                 if (v.segs.empty()) {
                     if (!subtitlePath.empty()) {
-                        v.segs = json3 ? transcript::parseJson3(subtitlePath)
-                                       : transcript::splitWords(subtitle::parseFile(subtitlePath));
+                        v.segs = json3 ? transcript::parseJson3(subtitlePath, lang)
+                                       : transcript::splitWords(subtitle::parseFile(subtitlePath, lang), lang);
                         if (v.segs.empty()) throw std::runtime_error("자막에서 문장을 만들지 못했습니다: " + subtitlePath);
                     } else {
                         if (!stt || !stt->loaded()) {
@@ -134,7 +136,7 @@ struct Loader {
                             setStatus("자막이 없어 whisper 로 대본 생성 중... " + std::to_string(p) + "%");
                         }, &serr);
                         if (!serr.empty()) throw std::runtime_error(serr);
-                        v.segs = transcript::splitWords(std::move(words));
+                        v.segs = transcript::splitWords(std::move(words), lang);
                         if (v.segs.empty()) throw std::runtime_error("음성에서 문장을 찾지 못했습니다");
                     }
                     transcript::save(v.segs, segPath);
@@ -163,24 +165,24 @@ struct SttLoader {
     bool busy = false;
     bool ready = false;
 
-    void start(Stt* stt, bool download) {
+    void start(Stt* stt, bool download, Lang lang = Lang::En) {
         if (th.joinable()) th.join();
-        { std::lock_guard<std::mutex> lock(m); busy = true; status = download ? "STT 모델 다운로드 중 (약 148MB)..." : "STT 모델 로딩 중..."; }
-        th = std::thread([this, stt, download] {
+        { std::lock_guard<std::mutex> lock(m); busy = true; status = download ? std::string(langName(lang)) + " STT 모델 다운로드 중 (약 " + std::to_string(Stt::modelSizeMB(lang)) + "MB)..." : std::string(langName(lang)) + " STT 모델 로딩 중..."; }
+        th = std::thread([this, stt, download, lang] {
             std::string err;
-            const std::string path = Stt::defaultModelPath();
+            const std::string path = Stt::modelPath(lang);
             try {
                 if (download && !fs::exists(path)) {
                     fs::create_directories(fs::path(path).parent_path());
                     std::string part = path + ".part";
-                    std::string cmd = "curl -L --fail -o \"" + part + "\" \"" + Stt::modelUrl() + "\"";
+                    std::string cmd = "curl -L --fail -o \"" + part + "\" \"" + Stt::modelUrl(lang) + "\"";
                     if (paths::runCommand(cmd, yt::logPath()) != 0 || !fs::exists(part)) {
                         throw std::runtime_error("모델 다운로드 실패. 로그: " + yt::logPath());
                     }
                     fs::rename(part, path);
                 }
-                { std::lock_guard<std::mutex> lock(m); status = "STT 모델 로딩 중..."; }
-                if (!stt->load(path, &err)) throw std::runtime_error(err);
+                { std::lock_guard<std::mutex> lock(m); status = std::string(langName(lang)) + " STT 모델 로딩 중..."; }
+                if (!stt->load(path, &err, lang)) throw std::runtime_error(err);
             } catch (const std::exception& e) {
                 err = e.what();
             }
@@ -202,16 +204,16 @@ struct ScoreJob {
     ScoreResult result;
     std::string err;
 
-    void start(Stt* stt, long long pid, std::string reference, std::vector<float> pcm48k) {
+    void start(Stt* stt, long long pid, std::string reference, std::vector<float> pcm48k, Lang lang = Lang::En) {
         if (th.joinable()) th.join();
         { std::lock_guard<std::mutex> lock(m); running = true; done = false; practiceId = pid; err.clear(); }
-        th = std::thread([this, stt, reference, pcm = std::move(pcm48k)] {
+        th = std::thread([this, stt, reference, lang, pcm = std::move(pcm48k)] {
             ScoreResult r;
             std::string e;
             try {
                 auto pcm16 = AudioEngine::resample(pcm, AudioEngine::kSampleRate, Stt::kRate);
                 std::string heard = stt->transcribeText(pcm16, &e);
-                if (e.empty()) r = scoreTranscript(reference, heard);
+                if (e.empty()) r = scoreTranscript(reference, heard, lang);
             } catch (const std::exception& ex) {
                 e = ex.what();
             }
@@ -249,9 +251,15 @@ struct App {
     Recorder recorder;
     Player recPlayer;
     Db db;
-    Stt stt;
+    Stt sttEn, sttJa;              // 언어별 whisper (영어 base.en / 일본어 small)
     Loader loader;
-    SttLoader sttLoader;
+    SttLoader sttLoaderEn, sttLoaderJa;
+    Lang uiLang = Lang::En;        // 새 영상을 불러올 때 쓰는 학습 언어 (홈에서 선택, 설정에 저장)
+
+    Lang curLang() const { return loaded ? video.lang : uiLang; }
+    Stt& sttFor(Lang l) { return l == Lang::Ja ? sttJa : sttEn; }
+    SttLoader& sttLoaderFor(Lang l) { return l == Lang::Ja ? sttLoaderJa : sttLoaderEn; }
+    Stt& sttCur() { return sttFor(curLang()); }
     ScoreJob scoreJob;
 
     LoadedVideo video;
@@ -390,6 +398,72 @@ struct App {
         Clock::time_point copiedAt;
     } wordDrag;
     int scriptWordClick = -1;  // --script 의 word 명령: 다음 프레임에 이 단어를 클릭한 것으로 처리
+    std::string wordHintReading, wordHintKorean;  // 클릭한 일본어 토큰의 읽기/발음 (AI 응답 전에도 보여 준다)
+
+    // ---- 일본어 읽기 (토큰 · 후리가나 · 한국어 발음) ----
+    struct ReadingJob {
+        std::thread th;
+        std::mutex m;
+        bool running = false;
+        std::string videoId;
+        std::vector<int> queue;
+        int done = 0;
+        std::vector<std::pair<int, JaReading>> ready;
+        std::string err;
+        std::atomic<bool> cancel{false};
+        ~ReadingJob() { cancel = true; if (th.joinable()) th.join(); }
+    } readingJob;
+    std::map<int, JaReading> readings;       // AI 가 만든 읽기 (DB 캐시)
+    std::map<int, JaReading> roughReadings;  // AI 없을 때의 간이 읽기 (가나만 변환)
+    std::set<int> readingRequested;          // 자동 요청 중복 방지
+    std::vector<int> readingPending;         // 작업 중에 들어온 요청
+    bool showPron = true;                    // 자막 아래 한국어 발음 표시
+
+    const JaReading& readingFor(int i) {
+        auto it = readings.find(i);
+        if (it != readings.end()) return it->second;
+        if (llm.ready() && !readingRequested.count(i)) { readingRequested.insert(i); requestReadings({i}); }
+        auto& r = roughReadings[i];
+        if (r.empty()) r = roughJapaneseReading(seg(i).text);
+        return r;
+    }
+
+    void requestReadings(std::vector<int> idxs) {
+        if (!loaded || !llm.ready() || idxs.empty()) return;
+        if (readingJob.running) { readingPending.insert(readingPending.end(), idxs.begin(), idxs.end()); return; }
+        if (readingJob.th.joinable()) readingJob.th.join();
+        readingJob.running = true;
+        readingJob.cancel = false;
+        readingJob.videoId = video.id;
+        readingJob.queue = idxs;
+        readingJob.done = 0;
+        readingJob.err.clear();
+        readingJob.ready.clear();
+        LlmConfig cfg = llm;
+        std::vector<Segment> segs = video.segs;
+        readingJob.th = std::thread([this, cfg, segs, idxs] {
+            for (int i : idxs) {
+                if (readingJob.cancel) break;
+                if (i < 0 || i >= (int)segs.size()) continue;
+                std::string e;
+                JaReading r = readJapanese(cfg, segs[i].text, &e);
+                std::lock_guard<std::mutex> lock(readingJob.m);
+                readingJob.done++;
+                if (e.empty()) readingJob.ready.push_back({i, r});
+                else { readingJob.err = e; if (idxs.size() == 1) break; }
+            }
+            std::lock_guard<std::mutex> lock(readingJob.m);
+            readingJob.running = false;
+        });
+    }
+
+    void requestAllReadings() {
+        std::vector<int> idxs;
+        for (int i = 0; i < (int)video.segs.size(); ++i) if (!readings.count(i)) idxs.push_back(i);
+        if (idxs.empty()) { message = "모든 문장에 읽기가 있습니다"; return; }
+        for (int i : idxs) readingRequested.insert(i);
+        requestReadings(idxs);
+    }
 
     // ---- 문장 학습 (리스닝 받아쓰기 / 영작) ----
     int quizKind = 0;            // 0: 리스닝(자막 없이 받아쓰기), 1: 영작(한국어 → 영어)
@@ -411,9 +485,11 @@ struct App {
         tts.setVolume(100);
     }
 
-    void speak(const std::string& text) {
+    void speak(const std::string& text) { speak(text, curLang()); }
+    void speak(const std::string& text, Lang lang) {
         if (!tts.available()) { message = "이 PC 에 음성 합성 엔진이 없습니다"; return; }
-        tts.speak(text, ttsSlow ? -4 : 0);
+        if (!tts.hasVoice(lang) && lang == Lang::Ja) message = "일본어 음성이 설치되어 있지 않아 영어 음성으로 읽습니다 (Windows 설정 > 시간 및 언어 > 음성 > 음성 추가 > 일본어)";
+        tts.speak(text, ttsSlow ? -4 : 0, lang);
     }
 
     // 단어 버튼용: 앞뒤 문장 부호 제거
@@ -543,6 +619,8 @@ struct App {
         videoVolume = std::clamp(std::stoi(db.getSetting("audio.videoVolume", "100")), 0, 100);
         recVolume = std::clamp(std::stoi(db.getSetting("audio.recVolume", "100")), 0, 200);
         ttsSlow = db.getSetting("tts.slow", "0") == "1";
+        uiLang = langFromCode(db.getSetting("ui.lang", "en"));
+        showPron = db.getSetting("ja.showPron", "1") == "1";
         snprintf(keyBuf[0], sizeof keyBuf[0], "%s", llm.claudeKey.c_str());
         snprintf(keyBuf[1], sizeof keyBuf[1], "%s", llm.openaiKey.c_str());
         snprintf(keyBuf[2], sizeof keyBuf[2], "%s", llm.geminiKey.c_str());
@@ -621,13 +699,14 @@ struct App {
         LlmConfig cfg = llm;
         std::vector<Segment> segs = video.segs;
         std::vector<int> queue = explainJob.queue;
-        explainJob.th = std::thread([this, cfg, segs, queue] {
+        const Lang lang = video.lang;
+        explainJob.th = std::thread([this, cfg, segs, queue, lang] {
             for (int i : queue) {
                 if (explainJob.cancel) break;
                 std::string before = i > 0 ? segs[i - 1].text : "";
                 std::string after = i + 1 < (int)segs.size() ? segs[i + 1].text : "";
                 std::string e;
-                Explanation ex = explainSentence(cfg, segs[i].text, before, after, &e);
+                Explanation ex = explainSentence(cfg, segs[i].text, before, after, &e, lang);
                 std::lock_guard<std::mutex> lock(explainJob.m);
                 explainJob.done++;
                 if (e.empty()) explainJob.ready.push_back({i, ex});
@@ -723,9 +802,9 @@ struct App {
         long long pid = log(current, modeName, path);
         haveScore = false;
         scoreSeg = current;
-        if (stt.loaded()) {
+        if (sttCur().loaded()) {
             scoring = true;
-            scoreJob.start(&stt, pid, seg(current).text, myRec);
+            scoreJob.start(&sttCur(), pid, seg(current).text, myRec, video.lang);
         }
         return pid;
     }
@@ -807,7 +886,7 @@ struct App {
 
     void checkQuiz() {
         if (!valid(quizSeg)) return;
-        quizScore = scoreTranscript(seg(quizSeg).text, quizBuf);
+        quizScore = scoreTranscript(seg(quizSeg).text, quizBuf, video.lang);
         quizChecked = true;
         quizRevealed = true;
         long long pid = log(quizSeg, quizKind == 0 ? "listen" : "compose");
@@ -974,8 +1053,10 @@ struct App {
         }
         // STT 로더
         {
-            std::lock_guard<std::mutex> lock(sttLoader.m);
-            if (!sttLoader.busy && !sttLoader.status.empty()) { message = sttLoader.status; sttLoader.status.clear(); }
+            for (SttLoader* sl : {&sttLoaderEn, &sttLoaderJa}) {
+                std::lock_guard<std::mutex> lock(sl->m);
+                if (!sl->busy && !sl->status.empty()) { message = sl->status; sl->status.clear(); }
+            }
         }
         // AI 모델 목록 / 연결 테스트
         {
@@ -1004,6 +1085,23 @@ struct App {
             if (!explainJob.running && !explainJob.err.empty()) { message = "해설 실패: " + explainJob.err; explainJob.err.clear(); }
         }
         // 채점
+        // 일본어 읽기 결과 수거
+        {
+            std::vector<int> toStart;
+            {
+                std::lock_guard<std::mutex> lock(readingJob.m);
+                if (!readingJob.ready.empty()) {
+                    for (auto& [i, r] : readingJob.ready) {
+                        db.setReading(readingJob.videoId, i, r.toJson());
+                        if (loaded && video.id == readingJob.videoId) readings[i] = r;
+                    }
+                    readingJob.ready.clear();
+                }
+                if (!readingJob.running && !readingJob.err.empty()) { message = "읽기 생성 실패: " + readingJob.err; readingJob.err.clear(); }
+                if (!readingJob.running && !readingPending.empty()) toStart.swap(readingPending);
+            }
+            if (!toStart.empty()) requestReadings(toStart);
+        }
         // 단어 뜻 결과 수거
         {
             std::lock_guard<std::mutex> lock(wordJob.m);
@@ -1048,7 +1146,14 @@ struct App {
         haveScore = false;
         scoreSeg = -1;
         int durMs = (int)(video.peaks.size() / 2) * kPeakBinMs;
-        db.upsertVideo(video.id, video.title, durMs);
+        db.upsertVideo(video.id, video.title, durMs, video.lang);
+        readings.clear();
+        if (video.lang == Lang::Ja) {
+            for (int i = 0; i < (int)video.segs.size(); ++i) {
+                std::string j = db.getReading(video.id, i);
+                if (!j.empty()) { JaReading r = JaReading::fromJson(j); if (!r.empty()) readings[i] = r; }
+            }
+        }
         db.upsertSegments(video.id, video.segs);
         refreshStats();
         mpv.load(video.videoPath);
@@ -1071,7 +1176,7 @@ struct App {
         while (!in.empty() && std::isspace((unsigned char)in.back())) in.pop_back();
         while (!in.empty() && std::isspace((unsigned char)in.front())) in.erase(0, 1);
         if (in.size() >= 2 && in.front() == '"' && in.back() == '"') in = in.substr(1, in.size() - 2);
-        if (local::isLocalId(in)) { loader.stt = &stt; loader.start(in); return; }
+        if (local::isLocalId(in)) { startLoad(in, db.hasVideo(in) ? db.videoLang(in) : uiLang); return; }
         // 내 PC 의 파일 경로?
         std::error_code ec;
         if (fs::is_regular_file(fs::u8path(in), ec)) {
@@ -1083,8 +1188,18 @@ struct App {
         }
         auto id = yt::extractVideoId(in);
         if (!id) { message = "유튜브 영상 ID 나 영상 파일 경로로 인식되지 않습니다"; return; }
-        loader.stt = &stt;
-        loader.start(*id);
+        // 이미 등록된 영상은 그때의 학습 언어로, 새 영상은 홈에서 고른 언어로 연다
+        startLoad(*id, db.hasVideo(*id) ? db.videoLang(*id) : uiLang);
+    }
+
+    void startLoad(const std::string& id, Lang lang) {
+        loader.stt = &sttFor(lang);
+        loader.start(id, lang);
+    }
+
+    void setUiLang(Lang l) {
+        uiLang = l;
+        db.setSetting("ui.lang", langCode(l));
     }
 
     // ---- 내 영상 파일 ----
@@ -1094,6 +1209,7 @@ struct App {
         const std::string dir = paths::dataDir() + "/" + id;
         std::error_code ec;
         const bool registered = fs::exists(fs::u8path(dir + "/segments.json"), ec);
+        const Lang lang = registered && db.hasVideo(id) ? db.videoLang(id) : uiLang;
         std::string sub = subPath;
         if (registered) {
             // 이미 등록된 영상: 자막을 새로 지정했으면 교체 (학습 기록이 있으면 문장 번호가 어긋나므로 거부)
@@ -1103,13 +1219,12 @@ struct App {
             }
             sub.clear();
         } else if (sub.empty()) {
-            sub = local::findSiblingSubtitle(videoPath);
+            sub = local::findSiblingSubtitle(videoPath, lang);
         }
         loader.localVideo = videoPath;
         loader.localSub = sub;
         snprintf(urlBuf, sizeof urlBuf, "%s", videoPath.c_str());
-        loader.stt = &stt;
-        loader.start(id);
+        startLoad(id, lang);
     }
 
     // 자막 파일만 들어왔을 때: 열려 있는 로컬 영상의 자막으로 바꾼다
@@ -1118,8 +1233,7 @@ struct App {
         if (loader.busy) { message = "다른 영상을 불러오는 중입니다"; return; }
         if (!db.countsFor(video.id).empty()) { message = "이미 학습 기록이 있는 영상이라 자막을 바꿀 수 없습니다 (문장 번호가 어긋납니다)"; return; }
         local::replaceSubtitle(subPath, video.dir);
-        loader.stt = &stt;
-        loader.start(video.id);
+        startLoad(video.id, video.lang);
     }
 
     void onDropFiles(const std::vector<std::string>& paths) {
@@ -1227,10 +1341,19 @@ struct App {
             float wrap = avail.x * 0.9f;
             ImFont* font = ImGui::GetFont();
             float fsize = ImGui::GetFontSize() * 1.35f;
+            // 일본어: 자막 아래에 한국어 발음을 한 줄 더 (읽지 못하는 한자가 있어도 따라 말할 수 있게)
+            std::string pron;
+            if (video.lang == Lang::Ja && showPron) pron = readingFor(current).pronunciation;
+            const float psize = ImGui::GetFontSize() * 1.05f;
             ImVec2 ts = font->CalcTextSizeA(fsize, FLT_MAX, wrap, text.c_str());
-            ImVec2 pos(origin.x + (avail.x - ts.x) / 2, origin.y + avail.y - ts.y - 24);
-            dl->AddRectFilled(ImVec2(pos.x - 10, pos.y - 6), ImVec2(pos.x + ts.x + 10, pos.y + ts.y + 6), IM_COL32(0, 0, 0, 170), 6.0f);
-            dl->AddText(font, fsize, pos, IM_COL32(255, 255, 255, 255), text.c_str(), nullptr, wrap);
+            ImVec2 ps = pron.empty() ? ImVec2(0, 0) : font->CalcTextSizeA(psize, FLT_MAX, wrap, pron.c_str());
+            const float gap = pron.empty() ? 0.0f : 4.0f;
+            const float boxW = std::max(ts.x, ps.x), boxH = ts.y + gap + ps.y;
+            ImVec2 pos(origin.x + (avail.x - boxW) / 2, origin.y + avail.y - boxH - 24);
+            dl->AddRectFilled(ImVec2(pos.x - 10, pos.y - 6), ImVec2(pos.x + boxW + 10, pos.y + boxH + 6), IM_COL32(0, 0, 0, 170), 6.0f);
+            dl->AddText(font, fsize, ImVec2(pos.x + (boxW - ts.x) / 2, pos.y), IM_COL32(255, 255, 255, 255), text.c_str(), nullptr, wrap);
+            if (!pron.empty())
+                dl->AddText(font, psize, ImVec2(pos.x + (boxW - ps.x) / 2, pos.y + ts.y + gap), IM_COL32(255, 230, 140, 255), pron.c_str(), nullptr, wrap);
         }
         ImGui::EndChild();
     }
@@ -1238,6 +1361,18 @@ struct App {
     void drawSentenceList() {
         ImGui::TextDisabled("%s", video.title.c_str());
         ImGui::TextDisabled("문장 %d개  |  클릭: 재생  |  ★ 북마크", (int)video.segs.size());
+        if (video.lang == Lang::Ja) {
+            bool running; int done, total;
+            { std::lock_guard<std::mutex> lock(readingJob.m); running = readingJob.running; done = readingJob.done; total = (int)readingJob.queue.size(); }
+            ImGui::SameLine(0, 12);
+            if (running) ImGui::TextColored(ImVec4(1, 0.8f, 0.3f, 1), "읽기 생성 중 %d/%d", done, total);
+            else if ((int)readings.size() < (int)video.segs.size()) {
+                ImGui::BeginDisabled(!llm.ready());
+                if (ImGui::SmallButton("모든 문장 읽기 만들기 (AI)")) requestAllReadings();
+                ImGui::EndDisabled();
+                if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) ImGui::SetTooltip("문장마다 AI 를 한 번씩 호출해 한자 읽기와 한국어 발음을 만들어 목록에 표시합니다.%s", llm.ready() ? "" : "\nAI 설정에서 API 키를 먼저 넣으세요.");
+            } else ImGui::TextDisabled("읽기 %d/%d", (int)readings.size(), (int)video.segs.size());
+        }
         ImGui::Separator();
         for (int i = 0; i < (int)video.segs.size(); ++i) {
             const auto& s = seg(i);
@@ -1253,7 +1388,11 @@ struct App {
 
             const float wrap = ImGui::GetContentRegionAvail().x - 8;
             ImVec2 textSize = ImGui::CalcTextSize(s.text.c_str(), nullptr, false, wrap);
-            float h = ImGui::GetTextLineHeight() + textSize.y + 6;
+            // 일본어: AI 읽기가 있으면 한국어 발음을 한 줄 더 보여 준다
+            const JaReading* rowRead = nullptr;
+            if (video.lang == Lang::Ja) { auto rit = readings.find(i); if (rit != readings.end() && !rit->second.pronunciation.empty()) rowRead = &rit->second; }
+            ImVec2 pronSize = rowRead ? ImGui::CalcTextSize(rowRead->pronunciation.c_str(), nullptr, false, wrap) : ImVec2(0, 0);
+            float h = ImGui::GetTextLineHeight() + textSize.y + pronSize.y + 6;
             bool selected = (i == current);
             if (ImGui::Selectable("##row", selected, 0, ImVec2(0, h))) playSegment(i, loopsSetting);
             if (ImGui::IsItemClicked(ImGuiMouseButton_Right)) toggleBookmark(i);
@@ -1267,6 +1406,8 @@ struct App {
             ImU32 col = selected ? IM_COL32(255, 230, 100, 255) : ImGui::GetColorU32(ImGuiCol_Text);
             const char* rowText = (i == quizSeg && valid(quizSeg) && !quizRevealed) ? "(학습 문제 진행 중 — 정답 공개 전까지 숨김)" : s.text.c_str();
             dl->AddText(font, fs, ImVec2(top.x + 4, top.y + 2 + ImGui::GetTextLineHeight()), col, rowText, nullptr, wrap);
+            if (rowRead && !(i == quizSeg && valid(quizSeg) && !quizRevealed))
+                dl->AddText(font, fs, ImVec2(top.x + 4, top.y + 2 + ImGui::GetTextLineHeight() + textSize.y), IM_COL32(255, 230, 140, 200), rowRead->pronunciation.c_str(), nullptr, wrap);
             ImGui::PopID();
         }
     }
@@ -1354,10 +1495,13 @@ struct App {
     void drawQuizTab() {
         if (!loaded) { ImGui::TextDisabled("영상을 불러오면 문장 학습을 할 수 있습니다."); return; }
 
-        ImGui::TextDisabled("자막 없이 듣고 받아쓰거나, 한국어 번역만 보고 영어로 써 보세요. 대소문자와 문장 부호는 채점에서 무시합니다.");
+        ImGui::TextDisabled("자막 없이 듣고 받아쓰거나, 한국어 번역만 보고 %s로 써 보세요. %s", langName(video.lang),
+                            video.lang == Lang::Ja ? "구두점과 띄어쓰기는 채점에서 무시하고 글자 단위로 비교합니다." : "대소문자와 문장 부호는 채점에서 무시합니다.");
         ImGui::RadioButton("리스닝 (받아쓰기)", &quizKind, 0);
         ImGui::SameLine();
-        ImGui::RadioButton("영작 (한국어 → 영어)", &quizKind, 1);
+        char composeLabel[64];
+        snprintf(composeLabel, sizeof composeLabel, "작문 (한국어 → %s)", langName(video.lang));
+        ImGui::RadioButton(composeLabel, &quizKind, 1);
         ImGui::Separator();
 
         if (!valid(quizSeg)) {
@@ -1472,6 +1616,16 @@ struct App {
         const Explanation& ex = it->second;
         ImGui::TextColored(ImVec4(0.6f, 0.8f, 1.0f, 1.0f), "번역");
         ImGui::TextWrapped("%s", ex.translation.c_str());
+        if (!ex.reading.empty() || !ex.pronunciation.empty()) {
+            ImGui::Spacing();
+            ImGui::TextColored(ImVec4(0.6f, 0.8f, 1.0f, 1.0f), "읽기 · 발음");
+            if (!ex.reading.empty()) ImGui::TextWrapped("%s", ex.reading.c_str());
+            if (!ex.pronunciation.empty()) {
+                ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 0.9f, 0.55f, 1.0f));
+                ImGui::TextWrapped("%s", ex.pronunciation.c_str());
+                ImGui::PopStyleColor();
+            }
+        }
         ImGui::Spacing();
         ImGui::TextColored(ImVec4(0.6f, 0.8f, 1.0f, 1.0f), "표현");
         for (size_t k = 0; k < ex.expressions.size(); ++k) {
@@ -1511,7 +1665,7 @@ struct App {
             ImGui::PushID((int)c.id);
             ImGui::TextColored(ImVec4(1.0f, 0.9f, 0.5f, 1.0f), "%s", c.text.c_str());
             ImGui::SameLine();
-            if (tts.available() && ImGui::SmallButton("듣기")) speak(c.text);
+            if (tts.available() && ImGui::SmallButton("듣기")) speak(c.text, db.videoLang(c.videoId));
             ImGui::SameLine();
             ImGui::TextDisabled("(%d회, 다음 %s)", c.reviews, c.dueAt.substr(0, 10).c_str());
             ImGui::SameLine();
@@ -1677,7 +1831,7 @@ struct App {
     // 단어 뜻 찾기: 캐시 → AI(키가 있으면) → 무료 영어 사전
     void lookupWord(const std::string& word, const std::string& sentence) {
         wordQuery = word;
-        wordKey = lowerAscii(word);
+        wordKey = curLang() == Lang::Ja ? word : lowerAscii(word);
         wordSentence = sentence;
         wordErr.clear();
         wordInfo = WordMeaning();
@@ -1698,18 +1852,25 @@ struct App {
         wordJob.running = true; wordJob.done = false; wordJob.hasPending = false;
         wordJob.word = key; wordJob.sentence = sentence;
         LlmConfig cfg = llm;
-        wordJob.th = std::thread([this, cfg, key, sentence] {
+        const Lang lang = curLang();
+        wordJob.th = std::thread([this, cfg, key, sentence, lang] {
             std::string e;
             WordMeaning r;
             if (cfg.ready()) {
-                r = explainWord(cfg, key, sentence, &e);
+                r = explainWord(cfg, key, sentence, &e, lang);
                 if (r.empty()) {  // AI 실패 → 사전으로 대체 (오류는 함께 보여 준다)
                     std::string e2;
-                    WordMeaning d = lookupDictionary(key, &e2);
+                    WordMeaning d = lookupDictionary(key, &e2, lang);
                     if (!d.empty()) r = d;
                 }
             } else {
-                r = lookupDictionary(key, &e);
+                r = lookupDictionary(key, &e, lang);
+            }
+            // 일본어: 가나만으로 된 단어는 AI 없이도 읽기/발음을 채울 수 있다
+            if (lang == Lang::Ja && r.reading.empty()) {
+                bool kanaOnly = true;
+                for (const auto& ch : jp::splitChars(key)) if (jp::isKanji(jp::decodeFirst(ch))) { kanaOnly = false; break; }
+                if (kanaOnly) { r.reading = jp::katakanaToHiragana(key); r.korean = jp::kanaToKorean(key); }
             }
             std::lock_guard<std::mutex> lock(wordJob.m);
             wordJob.result = r; wordJob.err = e; wordJob.done = true;
@@ -1735,8 +1896,21 @@ struct App {
         ImGui::SameLine();
         ImGui::TextDisabled("단어 클릭: 발음과 뜻  |  드래그: 복사");
 
-        std::vector<std::string> words;
-        { std::istringstream ss(sentence); std::string w; while (ss >> w) words.push_back(w); }
+        // 영어: 띄어쓰기 단위. 일본어: AI(또는 간이) 토큰 단위, 버튼 아래 줄에 한국어 발음.
+        const bool ja = video.lang == Lang::Ja;
+        std::vector<std::string> words, labels;
+        const JaReading* rd = nullptr;
+        if (ja) {
+            rd = &readingFor(current);
+            for (const auto& t : rd->tokens) {
+                words.push_back(t.surface);
+                labels.push_back(t.korean.empty() ? t.surface : t.surface + "\n" + t.korean);
+            }
+        } else {
+            std::istringstream ss(sentence);
+            std::string w;
+            while (ss >> w) { words.push_back(w); labels.push_back(w); }
+        }
         std::vector<std::pair<ImVec2, ImVec2>> rects(words.size());
 
         // 드래그 판정: 누른 뒤 조금 움직이면 드래그 (버튼 클릭은 무시)
@@ -1751,9 +1925,9 @@ struct App {
         int clicked = -1;
         for (size_t k = 0; k < words.size(); ++k) {
             ImGui::PushID((int)k);
-            float bw = ImGui::CalcTextSize(words[k].c_str()).x + ImGui::GetStyle().FramePadding.x * 2;
+            float bw = ImGui::CalcTextSize(labels[k].c_str()).x + ImGui::GetStyle().FramePadding.x * 2;
             if (ImGui::GetItemRectMax().x + spacing + bw <= lineRight) ImGui::SameLine();
-            bool pressed = ImGui::SmallButton(words[k].c_str());
+            bool pressed = ja ? ImGui::Button((labels[k] + "##tok").c_str()) : ImGui::SmallButton(words[k].c_str());
             rects[k] = {ImGui::GetItemRectMin(), ImGui::GetItemRectMax()};
             if (ImGui::IsItemClicked(ImGuiMouseButton_Left)) {
                 wordDrag.anchor = (int)k;
@@ -1777,7 +1951,7 @@ struct App {
                 if (!mouseDown) {
                     if (wordDrag.dragging && wordDrag.a >= 0) {
                         std::string sel;
-                        for (int i = wordDrag.a; i <= wordDrag.b; ++i) { if (i > wordDrag.a) sel += ' '; sel += words[i]; }
+                        for (int i = wordDrag.a; i <= wordDrag.b; ++i) { if (i > wordDrag.a && !ja) sel += ' '; sel += words[i]; }
                         copyText(sel);
                     } else {
                         wordDrag.a = wordDrag.b = -1;
@@ -1798,7 +1972,36 @@ struct App {
         }
 
         if (scriptWordClick >= 0 && scriptWordClick < (int)words.size()) { clicked = scriptWordClick; scriptWordClick = -1; }
-        if (clicked >= 0) openWord(words[clicked], sentence, ImVec2(rects[clicked].first.x, rects[clicked].second.y + 4 * uiScale));
+        if (clicked >= 0) {
+            wordHintReading.clear();
+            wordHintKorean.clear();
+            if (ja && rd && clicked < (int)rd->tokens.size()) { wordHintReading = rd->tokens[clicked].reading; wordHintKorean = rd->tokens[clicked].korean; }
+            openWord(words[clicked], sentence, ImVec2(rects[clicked].first.x, rects[clicked].second.y + 4 * uiScale));
+        }
+
+        // 일본어: 문장 전체 읽기와 한국어 발음
+        if (ja && rd) {
+            if (!rd->reading.empty()) {
+                ImGui::TextDisabled("읽기:");
+                ImGui::SameLine();
+                ImGui::TextWrapped("%s", rd->reading.c_str());
+            }
+            if (!rd->pronunciation.empty()) {
+                ImGui::TextDisabled("발음:");
+                ImGui::SameLine();
+                ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 0.9f, 0.55f, 1.0f));
+                ImGui::TextWrapped("%s", rd->pronunciation.c_str());
+                ImGui::PopStyleColor();
+            }
+            if (rd->provider == "간이") {
+                ImGui::TextDisabled("%s", llm.ready() ? "AI 로 읽기를 만드는 중... (가나만 먼저 변환해 보여 줍니다)"
+                                                      : "AI 설정에서 API 키를 넣으면 한자 읽기와 정확한 발음, 단어 뜻을 표시합니다. 지금은 가나만 변환합니다.");
+            } else {
+                ImGui::SameLine(0, 12);
+                ImGui::TextDisabled("%s · %s", rd->provider.c_str(), rd->model.c_str());
+            }
+            if (ImGui::Checkbox("자막 아래 발음 표시", &showPron)) db.setSetting("ja.showPron", showPron ? "1" : "0");
+        }
 
         // 단어 뜻 팝업
         ImGui::SetNextWindowPos(wordPopupPos, ImGuiCond_Appearing);
@@ -1834,6 +2037,19 @@ struct App {
         if (!w.ipa.empty()) { ImGui::SameLine(); ImGui::TextDisabled("%s", w.ipa.c_str()); }
         if (!w.pos.empty()) { ImGui::SameLine(); ImGui::TextDisabled("[%s]", w.pos.c_str()); }
         if (!w.word.empty() && lowerAscii(w.word) != wordKey) { ImGui::SameLine(); ImGui::TextDisabled("(문장에서는 \"%s\")", wordQuery.c_str()); }
+        {
+            const std::string& reading = w.reading.empty() ? wordHintReading : w.reading;
+            const std::string& korean = w.korean.empty() ? wordHintKorean : w.korean;
+            if (!reading.empty() || !korean.empty()) {
+                ImGui::TextDisabled("읽기");
+                ImGui::SameLine();
+                ImGui::TextUnformatted(reading.c_str());
+                ImGui::SameLine(0, 14);
+                ImGui::TextDisabled("발음");
+                ImGui::SameLine();
+                ImGui::TextColored(ImVec4(1.0f, 0.9f, 0.55f, 1.0f), "%s", korean.c_str());
+            }
+        }
         ImGui::Separator();
 
         if (wordLoading) {
@@ -1896,7 +2112,7 @@ struct App {
         if (quizHidden()) { ImGui::TextDisabled("문장 학습 문제 진행 중이라 채점 결과를 숨깁니다."); return; }
         if (scoring) { ImGui::TextColored(ImVec4(1, 0.8f, 0.3f, 1), "채점 중..."); return; }
         if (!haveScore || scoreSeg != current) {
-            if (!stt.loaded()) ImGui::TextDisabled("STT 모델을 받으면 녹음을 자동으로 채점합니다.");
+            if (!sttCur().loaded()) ImGui::TextDisabled("%s STT 모델을 받으면 녹음을 자동으로 채점합니다.", langName(curLang()));
             else ImGui::TextDisabled("쉐도잉 / 따라말하기 후 여기에 채점 결과가 표시됩니다.");
             return;
         }
@@ -1973,6 +2189,14 @@ struct App {
         ImGui::TextColored(ImVec4(0.6f, 0.8f, 1.0f, 1.0f), "내 영상 (%d)", (int)library.size());
         ImGui::SameLine();
         ImGui::TextDisabled("클릭: 열기  |  오른쪽 클릭: 기록 삭제");
+        // 학습 언어: 새로 불러오는 영상에 적용된다 (이미 등록된 영상은 그때의 언어를 유지)
+        ImGui::TextDisabled("학습 언어:");
+        ImGui::SameLine();
+        if (ImGui::RadioButton("영어", uiLang == Lang::En)) setUiLang(Lang::En);
+        ImGui::SameLine();
+        if (ImGui::RadioButton("일본어", uiLang == Lang::Ja)) setUiLang(Lang::Ja);
+        ImGui::SameLine(0, 12);
+        ImGui::TextDisabled(uiLang == Lang::Ja ? "일본어 자막을 받고, 단어마다 읽기와 한국어 발음을 보여 줍니다" : "영어 자막을 받고, 단어 발음과 뜻을 보여 줍니다");
         ImGui::Separator();
         if (library.empty()) {
             ImGui::Spacing();
@@ -2000,7 +2224,8 @@ struct App {
             ImFont* font = ImGui::GetFont();
             float fs = ImGui::GetFontSize();
             const float wrap = bot.x - top.x - 8;
-            dl->AddText(font, fs, ImVec2(top.x + 6, top.y + 4), IM_COL32(255, 255, 255, 255), v.title.c_str(), nullptr, wrap);
+            const std::string cardTitle = std::string(v.lang == Lang::Ja ? "[일본어] " : "") + (local::isLocalId(v.id) ? "[내 파일] " : "") + v.title;
+            dl->AddText(font, fs, ImVec2(top.x + 6, top.y + 4), IM_COL32(255, 255, 255, 255), cardTitle.c_str(), nullptr, wrap);
             // 진행률 바
             float frac = v.segCount > 0 ? v.practicedSegs / (float)v.segCount : 0.0f;
             ImVec2 b0(top.x + 6, top.y + 4 + lh + 4), b1(top.x + 6 + wrap * 0.5f, b0.y + lh - 4);
@@ -2068,7 +2293,7 @@ struct App {
                 const auto& it = session.queue[session.pos];
                 ImGui::TextColored(ImVec4(1.0f, 0.9f, 0.5f, 1.0f), "표현 카드:  %s", it.text.c_str());
                 ImGui::SameLine();
-                if (tts.available() && ImGui::SmallButton("듣기")) speak(it.text);
+                if (tts.available() && ImGui::SmallButton("듣기")) speak(it.text, it.lang);
                 ImGui::SameLine();
                 if (!cardRevealed) { if (ImGui::SmallButton("뜻 보기")) cardRevealed = true; }
                 else {
@@ -2230,6 +2455,7 @@ struct App {
         else if (cmd == "quiz") startQuiz(std::max(0, current), arg == "compose" ? 1 : 0);
         else if (cmd == "quiz_answer") { std::string rest; std::getline(ss, rest); snprintf(quizBuf, sizeof quizBuf, "%s", (arg + rest).c_str()); checkQuiz(); }
         else if (cmd == "quiz_reveal") quizRevealed = true;
+        else if (cmd == "lang") setUiLang(langFromCode(arg));
         else if (cmd == "word" && valid(current)) {  // word <k>: 현재 문장의 k 번째 단어를 클릭한 것처럼
             std::vector<std::string> ws; std::istringstream ws_(seg(current).text); for (std::string w; ws_ >> w;) ws.push_back(w);
             int k = std::clamp(std::atoi(arg.c_str()), 0, (int)ws.size() - 1);
@@ -2241,7 +2467,7 @@ struct App {
             std::string sel; for (int i = a; i <= b; ++i) { if (i > a) sel += ' '; sel += ws[i]; }
             wordDrag.a = a; wordDrag.b = b; copyText(sel);
         }
-        else if (cmd == "rescore" && valid(current) && stt.loaded()) {
+        else if (cmd == "rescore" && valid(current) && sttCur().loaded()) {
             // 현재 문장의 마지막 녹음을 다시 채점 (마이크 없이 채점 화면 확인용)
             std::string path = db.lastRecording(video.id, current);
             if (!path.empty() && fs::exists(path)) {
@@ -2249,7 +2475,7 @@ struct App {
                 scoring = true;
                 haveScore = false;
                 scoreSeg = current;
-                scoreJob.start(&stt, 0, seg(current).text, myRec);
+                scoreJob.start(&sttCur(), 0, seg(current).text, myRec, video.lang);
             }
         }
         else if (cmd == "review") startSession();
@@ -2280,14 +2506,16 @@ struct App {
         { std::lock_guard<std::mutex> lock(loader.m); busy = loader.busy; status = loader.status; }
         bool sttBusy;
         std::string sttStatus;
-        { std::lock_guard<std::mutex> lock(sttLoader.m); sttBusy = sttLoader.busy; sttStatus = sttLoader.status; }
+        const Lang sl = curLang();
+        { SttLoader& ld = sttLoaderFor(sl); std::lock_guard<std::mutex> lock(ld.m); sttBusy = ld.busy; sttStatus = ld.status; }
 
         if (showHome) ImGui::BeginDisabled(!loaded);
         if (ImGui::Button(showHome ? "학습 화면" : "홈")) { if (showHome) showHome = false; else goHome(); }
         if (showHome) ImGui::EndDisabled();
         ImGui::SameLine();
         ImGui::SetNextItemWidth(420 * uiScale);
-        bool enter = ImGui::InputTextWithHint("##url", "유튜브 URL / 영상 ID / 내 영상 파일 경로 (파일을 창에 끌어다 놓아도 됩니다)", urlBuf, sizeof urlBuf, ImGuiInputTextFlags_EnterReturnsTrue);
+        const std::string hint = std::string("유튜브 URL / 영상 ID / 내 영상 파일 경로  (새 영상은 ") + langName(uiLang) + " 로 불러옵니다 · 홈에서 변경)";
+        bool enter = ImGui::InputTextWithHint("##url", hint.c_str(), urlBuf, sizeof urlBuf, ImGuiInputTextFlags_EnterReturnsTrue);
         ImGui::SameLine();
         ImGui::BeginDisabled(busy);
         if (ImGui::Button("불러오기") || enter) requestLoad(urlBuf);
@@ -2300,11 +2528,15 @@ struct App {
         ImGui::SameLine(0, 16);
         if (ImGui::Button(llm.ready() ? "AI 설정" : "AI 설정 (키 없음)")) showSettings = true;
         ImGui::SameLine(0, 16);
-        if (!stt.loaded()) {
+        if (!sttFor(sl).loaded()) {
             if (sttBusy) ImGui::TextColored(ImVec4(1, 0.8f, 0.3f, 1), "%s", sttStatus.c_str());
-            else if (ImGui::Button("STT 모델 받기 (148MB, 채점/자막 생성용)")) sttLoader.start(&stt, true);
+            else {
+                char b[128];
+                snprintf(b, sizeof b, "%s STT 모델 받기 (%dMB, 채점/자막 생성용)", langName(sl), Stt::modelSizeMB(sl));
+                if (ImGui::Button(b)) sttLoaderFor(sl).start(&sttFor(sl), true, sl);
+            }
         } else {
-            ImGui::TextColored(ImVec4(0.5f, 0.9f, 0.5f, 1), "STT 준비됨");
+            ImGui::TextColored(ImVec4(0.5f, 0.9f, 0.5f, 1), "%s STT 준비됨", langName(sl));
         }
         ImGui::SameLine(0, 16);
         if (busy) ImGui::TextColored(ImVec4(1, 0.8f, 0.3f, 1), "%s", status.c_str());
@@ -2468,6 +2700,20 @@ int main(int argc, char** argv) {
     const char* fontPath = "/System/Library/Fonts/AppleSDGothicNeo.ttc";  // 한글 지원 기본 폰트
 #endif
     if (fs::exists(fontPath)) io.Fonts->AddFontFromFileTTF(fontPath, 18.0f * uiScale);
+    // 일본어(한자 · 가나) 글리프는 기본 폰트에 없어 일본어 폰트를 합친다 (기본 폰트에 없는 글자만 가져온다)
+    {
+#ifdef _WIN32
+        const char* jpFonts[] = {"C:/Windows/Fonts/YuGothM.ttc", "C:/Windows/Fonts/meiryo.ttc", "C:/Windows/Fonts/msgothic.ttc", "C:/Windows/Fonts/YuGothR.ttc"};
+#else
+        const char* jpFonts[] = {"/System/Library/Fonts/ヒラギノ角ゴシック W4.ttc", "/System/Library/Fonts/ヒラギノ角ゴシック W3.ttc",
+                                 "/System/Library/Fonts/Hiragino Sans GB.ttc", "/Library/Fonts/Arial Unicode.ttf"};
+#endif
+        ImFontConfig merge;
+        merge.MergeMode = true;
+        for (const char* f : jpFonts) {
+            if (fs::exists(fs::u8path(f))) { io.Fonts->AddFontFromFileTTF(f, 18.0f * uiScale, &merge); break; }
+        }
+    }
     ImGui_ImplGlfw_InitForOpenGL(window, true);
 #ifdef __APPLE__
     ImGui_ImplOpenGL3_Init("#version 150");
@@ -2499,7 +2745,8 @@ int main(int argc, char** argv) {
     app.loadSettings();
     app.tts.init();
     app.applyAudioSettings();
-    if (fs::exists(Stt::defaultModelPath())) app.sttLoader.start(&app.stt, false);
+    for (Lang l : {Lang::En, Lang::Ja})
+        if (fs::exists(Stt::modelPath(l))) app.sttLoaderFor(l).start(&app.sttFor(l), false, l);
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
         if (a == "--script" && i + 1 < argc) {

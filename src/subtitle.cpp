@@ -176,8 +176,10 @@ std::vector<Word> blocksToWords(const std::vector<Block>& blocks) {
 
 // ---- SMI (SAMI) ----
 
-// <STYLE> 에서 .CLASS { lang: en-US } 처럼 영어로 선언된 클래스 이름들을 찾는다
-std::vector<std::string> englishClasses(const std::string& doc) {
+// <STYLE> 에서 .CLASS { lang: en-US } 처럼 해당 언어로 선언된 클래스 이름들을 찾는다
+std::vector<std::string> classesForLang(const std::string& doc, Lang lang) {
+    const std::string code = langCode(lang);
+    const std::string nameWord = lang == Lang::Ja ? "japanese" : "english";
     std::vector<std::string> out;
     std::string low = lower(doc);
     size_t s = low.find("<style");
@@ -193,9 +195,9 @@ std::vector<std::string> englishClasses(const std::string& doc) {
             std::string body = style.substr(open, close - open);
             size_t l = body.find("lang:");
             if (l != std::string::npos) {
-                std::string lang = trim(body.substr(l + 5, 6));
-                if (lang.rfind("en", 0) == 0) out.push_back(name);
-            } else if (body.find("english") != std::string::npos) {
+                std::string declared = trim(body.substr(l + 5, 6));
+                if (declared.rfind(code, 0) == 0) out.push_back(name);
+            } else if (body.find(nameWord) != std::string::npos) {
                 out.push_back(name);
             }
             p = close;
@@ -217,7 +219,19 @@ double asciiRatio(const std::string& s) {
     return letters ? (double)ascii / letters : 0.0;
 }
 
-std::vector<Block> parseSmi(const std::string& doc) {
+// 일본어다움: 가나/한자 비율
+double japaneseRatio(const std::string& s) {
+    int letters = 0, jpn = 0;
+    for (const auto& ch : jp::splitChars(s)) {
+        unsigned cp = jp::decodeFirst(ch);
+        if (cp < 0x80 && !std::isalpha((int)cp)) continue;
+        ++letters;
+        if (jp::isKanji(cp) || jp::isHiragana(cp) || jp::isKatakana(cp)) ++jpn;
+    }
+    return letters ? (double)jpn / letters : 0.0;
+}
+
+std::vector<Block> parseSmi(const std::string& doc, Lang lang) {
     std::string low = lower(doc);
     struct Raw { int startMs; std::string cls; std::string html; };
     std::vector<Raw> raws;
@@ -273,16 +287,16 @@ std::vector<Block> parseSmi(const std::string& doc) {
     }
     if (raws.empty()) throw std::runtime_error("SMI 자막에서 <SYNC> 블록을 찾지 못했습니다");
 
-    // 클래스 선택: STYLE 의 영어 선언 → 하나뿐이면 그것 → 아스키 비율이 가장 높은 것
+    // 클래스 선택: STYLE 의 언어 선언 → 하나뿐이면 그것 → 그 언어 글자 비율이 가장 높은 것
     std::map<std::string, std::string> sample;
     for (const auto& r : raws) if (sample[r.cls].size() < 4000) sample[r.cls] += htmlToText(r.html) + " ";
     std::string chosen;
-    auto eng = englishClasses(doc);
-    for (const auto& c : eng) if (sample.count(c)) { chosen = c; break; }
+    auto declared = classesForLang(doc, lang);
+    for (const auto& c : declared) if (sample.count(c)) { chosen = c; break; }
     if (chosen.empty()) {
         double best = -1;
         for (const auto& [cls, text] : sample) {
-            double r = asciiRatio(text);
+            double r = lang == Lang::Ja ? japaneseRatio(text) : asciiRatio(text);
             if (r > best) { best = r; chosen = cls; }
         }
     }
@@ -364,13 +378,13 @@ bool isSubtitleExt(const std::string& ext) {
     return e == ".smi" || e == ".sami" || e == ".srt" || e == ".vtt";
 }
 
-std::vector<Word> parseFile(const std::string& path) {
+std::vector<Word> parseFile(const std::string& path, Lang lang) {
     std::string doc = readText(path);
     std::string ext = lower(fs::u8path(path).extension().u8string());
     std::string head = lower(doc.substr(0, std::min<size_t>(doc.size(), 2000)));
     std::vector<Block> blocks;
     if (ext == ".smi" || ext == ".sami" || head.find("<sami") != std::string::npos || head.find("<sync") != std::string::npos)
-        blocks = parseSmi(doc);
+        blocks = parseSmi(doc, lang);
     else
         blocks = parseSrtVtt(doc);
     std::sort(blocks.begin(), blocks.end(), [](const Block& a, const Block& b) { return a.startMs < b.startMs; });

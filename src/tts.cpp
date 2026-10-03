@@ -26,13 +26,12 @@ std::string narrow(const wchar_t* w) {
     return s;
 }
 
-// 영어(en-US 우선, 없으면 아무 영어) 음성 토큰을 찾는다
-ISpObjectToken* findEnglishVoice() {
+// 언어 ID 목록(우선순위 순) 으로 음성 토큰을 찾는다
+ISpObjectToken* findVoice(std::initializer_list<const wchar_t*> prefs) {
     ISpObjectTokenCategory* cat = nullptr;
     if (FAILED(CoCreateInstance(__uuidof(SpObjectTokenCategory), nullptr, CLSCTX_ALL, __uuidof(ISpObjectTokenCategory), (void**)&cat))) return nullptr;
     ISpObjectToken* found = nullptr;
     if (SUCCEEDED(cat->SetId(SPCAT_VOICES, FALSE))) {
-        const wchar_t* prefs[] = {L"Language=409", L"Language=809", L"Language=C09"};  // en-US, en-GB, en-AU
         for (const wchar_t* attr : prefs) {
             IEnumSpObjectTokens* en = nullptr;
             if (SUCCEEDED(cat->EnumTokens(attr, nullptr, &en)) && en) {
@@ -47,9 +46,22 @@ ISpObjectToken* findEnglishVoice() {
     return found;
 }
 
+std::string tokenName(ISpObjectToken* tok) {
+    if (!tok) return "";
+    wchar_t* desc = nullptr;
+    std::string name;
+    if (SUCCEEDED(tok->GetStringValue(nullptr, &desc)) && desc) {
+        name = narrow(desc);
+        CoTaskMemFree(desc);
+    }
+    return name;
+}
+
 }  // namespace
 
 Tts::~Tts() {
+    if (tokEn_) { tokEn_->Release(); tokEn_ = nullptr; }
+    if (tokJa_) { tokJa_->Release(); tokJa_ = nullptr; }
     if (voice_) { voice_->Release(); voice_ = nullptr; }
     if (comInit_) CoUninitialize();
 }
@@ -61,24 +73,29 @@ bool Tts::init() {
         voice_ = nullptr;
         return false;
     }
-    if (ISpObjectToken* tok = findEnglishVoice()) {
-        voice_->SetVoice(tok);
-        tok->Release();
+    tokEn_ = findVoice({L"Language=409", L"Language=809", L"Language=C09"});  // en-US, en-GB, en-AU
+    tokJa_ = findVoice({L"Language=411"});                                   // ja-JP (일본어 언어 팩의 Haruka/Ayumi/Ichiro)
+    voiceNameEn_ = tokenName(tokEn_);
+    voiceNameJa_ = tokenName(tokJa_);
+    if (tokEn_) voice_->SetVoice(tokEn_);
+    if (voiceNameEn_.empty()) {
+        ISpObjectToken* cur = nullptr;
+        if (SUCCEEDED(voice_->GetVoice(&cur)) && cur) { voiceNameEn_ = tokenName(cur); cur->Release(); }
     }
-    ISpObjectToken* cur = nullptr;
-    if (SUCCEEDED(voice_->GetVoice(&cur)) && cur) {
-        wchar_t* desc = nullptr;
-        if (SUCCEEDED(cur->GetStringValue(nullptr, &desc)) && desc) {
-            voiceName_ = narrow(desc);
-            CoTaskMemFree(desc);
-        }
-        cur->Release();
-    }
+    curLang_ = Lang::En;
     return true;
 }
 
-void Tts::speak(const std::string& text, int rate) {
+bool Tts::hasVoice(Lang lang) const {
+    return voice_ && (lang == Lang::Ja ? tokJa_ != nullptr : tokEn_ != nullptr);
+}
+
+void Tts::speak(const std::string& text, int rate, Lang lang) {
     if (!voice_ || text.empty()) return;
+    if (lang != curLang_) {
+        ISpObjectToken* tok = lang == Lang::Ja ? tokJa_ : tokEn_;
+        if (tok) { voice_->SetVoice(tok); curLang_ = lang; }
+    }
     voice_->SetRate(std::clamp(rate, -10, 10));
     voice_->Speak(widen(text).c_str(), SPF_ASYNC | SPF_PURGEBEFORESPEAK | SPF_IS_NOT_XML, nullptr);
 }

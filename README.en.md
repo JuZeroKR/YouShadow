@@ -18,11 +18,14 @@ Paste a link and it downloads the video with English subtitles, splits them into
 
 ![Word meaning](docs/word.png)
 
+![Japanese mode](docs/japanese.png)
+
 ## Features
 
 - **Load a video**: YouTube URL → yt-dlp downloads a 720p video and English subtitles (json3). If there are no subtitles, or YouTube blocks the subtitle request, a transcript is generated with whisper.cpp
 - **Your own video files**: open mkv / mp4 / avi / mov / webm files from your PC with [파일 열기] or by dropping them onto the window. A subtitle with the same name in the same folder (.smi / .srt / .vtt, including variants like `name.en.srt`) is picked up automatically; otherwise an English subtitle track inside the video is extracted, and failing that whisper generates a transcript. SMI files are read in CP949, UTF-8, or UTF-16, and when several languages are present the English class is chosen. The video itself is not copied — only its path is remembered
-- **Sentence splitting**: word timestamps are split into sentences by punctuation, silence, and length
+- **Japanese mode**: pick English or Japanese as the study language on the home screen. Japanese videos download Japanese subtitles, each sentence is split into word tokens with the **Korean pronunciation** under every token and a whole-sentence pronunciation line under the subtitle (so you can shadow even when you cannot read the kanji). Click a token for its reading (hiragana), Korean pronunciation, meaning and how it is used in the sentence. With an AI key the model does the tokenizing and kanji readings (once per sentence, cached in the DB); without one, only kana is converted. Scoring uses the multilingual whisper small model (466MB) and compares character by character; pronunciation uses a Japanese voice (Windows needs the Japanese language pack, macOS has Kyoko built in)
+- **Sentence splitting**: word timestamps are split into sentences by punctuation, silence, and length (Japanese: 。！？ and character count)
 - **Playback**: video via libmpv. Click a sentence to play it, loop, 0.5x–1.5x speed (pitch preserved), current sentence highlighted during free playback
 - **Practice modes**
   - Shadowing: speak along with the original (recording continues until you finish, even after the clip ends)
@@ -137,6 +140,8 @@ run-gui.cmd https://www.youtube.com/watch?v=VIDEO_ID
 
 You start on the home screen. Paste a URL into the box at the top and press [불러오기] (Load); after downloading you land on the study screen. Videos are downloaded once and cached.
 
+To study Japanese, choose 일본어 under "학습 언어" (study language) at the top of the home screen before loading a video. Each video remembers its language, so English and Japanese videos can live side by side. Japanese word pronunciation on Windows requires the Japanese voice from Settings > Time & Language > Speech > Add voices.
+
 For videos on your PC, use [파일 열기] (Open file) or drop the video file (optionally together with its subtitle file) onto the window; pasting a file path into the box also works. A .smi/.srt/.vtt with the same name in the same folder is read automatically. Dropping only a subtitle file replaces the subtitles of the open video (only while it has no practice history yet).
 
 When run from the repo root (dev mode) it uses `data/` and `models/`; otherwise `%LOCALAPPDATA%\YouShadow` on Windows and `~/Library/Application Support/YouShadow` on macOS. External-tool output is logged to `logs/tools.log` under that folder.
@@ -183,6 +188,7 @@ src/
   gui_main.cpp    ImGui app: layout, practice-mode state machine, home/review sessions, background jobs
   player.cpp      libmpv → OpenGL FBO texture
   youtube.cpp     URL parsing, yt-dlp / ffmpeg invocation
+  lang.cpp        study language (English/Japanese), Japanese helpers (rough tokenizer, kana → Korean pronunciation)
   transcript.cpp  word list → sentence segments, json3 subtitle parsing
   subtitle.cpp    SMI / SRT / VTT subtitle files → word list (encoding detection, English class selection)
   local.cpp       local video registration (ID, subtitle lookup, embedded-track extraction, audio extraction)

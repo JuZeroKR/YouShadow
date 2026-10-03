@@ -31,17 +31,24 @@ void progressThunk(whisper_context*, whisper_state*, int progress, void* user) {
 
 }  // namespace
 
-std::string Stt::defaultModelPath() { return paths::modelsDir() + "/ggml-base.en.bin"; }
-std::string Stt::modelUrl() {
-    return "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.en.bin";
+std::string Stt::defaultModelPath() { return modelPath(Lang::En); }
+std::string Stt::modelUrl() { return modelUrl(Lang::En); }
+std::string Stt::modelPath(Lang lang) {
+    return paths::modelsDir() + (lang == Lang::Ja ? "/ggml-small.bin" : "/ggml-base.en.bin");
 }
+std::string Stt::modelUrl(Lang lang) {
+    return std::string("https://huggingface.co/ggerganov/whisper.cpp/resolve/main/") +
+           (lang == Lang::Ja ? "ggml-small.bin" : "ggml-base.en.bin");
+}
+int Stt::modelSizeMB(Lang lang) { return lang == Lang::Ja ? 466 : 148; }
 
 Stt::~Stt() {
     if (ctx_) whisper_free(ctx_);
 }
 
-bool Stt::load(const std::string& modelPath, std::string* err) {
+bool Stt::load(const std::string& modelPath, std::string* err, Lang lang) {
     std::lock_guard<std::mutex> lock(m_);
+    lang_ = lang;
     whisper_log_set(quietLog, nullptr);
     ggml_log_set(quietLog, nullptr);
     whisper_context_params cp = whisper_context_default_params();
@@ -68,7 +75,7 @@ std::vector<Word> Stt::transcribe(const std::vector<float>& pcm16k,
     if (pcm.size() < (size_t)kRate * 2) pcm.resize((size_t)kRate * 2, 0.0f);
 
     whisper_full_params p = whisper_full_default_params(WHISPER_SAMPLING_GREEDY);
-    p.language = "en";
+    p.language = langCode(lang_);
     p.n_threads = threadCount();
     p.translate = false;
     p.no_context = true;

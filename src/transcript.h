@@ -2,6 +2,8 @@
 #include <string>
 #include <vector>
 
+#include "lang.h"
+
 struct Segment {
     int idx = 0;
     int startMs = 0;
@@ -19,10 +21,11 @@ struct Word {
 namespace transcript {
 
 // 단어 목록을 문장 부호 / 침묵 / 길이 기준으로 문장 세그먼트로 나눈다.
-std::vector<Segment> splitWords(std::vector<Word> words);
+// 일본어는 글자 수 기준으로 끊고 띄어쓰기 없이 잇는다.
+std::vector<Segment> splitWords(std::vector<Word> words, Lang lang = Lang::En);
 
 // 유튜브 json3 자막 파일을 문장 단위 세그먼트로 나눈다.
-std::vector<Segment> parseJson3(const std::string& path);
+std::vector<Segment> parseJson3(const std::string& path, Lang lang = Lang::En);
 
 // 한 번 나눈 세그먼트는 고정해 두기 위해 파일로 저장/로드한다.
 void save(const std::vector<Segment>& segs, const std::string& path);

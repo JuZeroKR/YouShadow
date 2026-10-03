@@ -44,11 +44,30 @@ std::vector<Tok> tokenize(const std::string& s) {
     return toks;
 }
 
+// 일본어: 글자 단위. 구두점/공백은 빼고, 가타카나는 히라가나로, 전각 영숫자는 반각 소문자로 맞춰 비교한다.
+std::vector<Tok> tokenizeJa(const std::string& s) {
+    std::vector<Tok> toks;
+    for (const auto& ch : jp::splitChars(s)) {
+        unsigned cp = jp::decodeFirst(ch);
+        if (cp < 0x80) {
+            if (!std::isalnum((int)cp)) continue;
+            toks.push_back({ch, std::string(1, (char)std::tolower((int)cp))});
+            continue;
+        }
+        if (jp::isJapanesePunct(cp) || cp == 0x3000) continue;
+        std::string norm = ch;
+        if (cp >= 0xFF10 && cp <= 0xFF5A) norm = std::string(1, (char)std::tolower((int)(cp - 0xFF10 + '0')));
+        else norm = jp::katakanaToHiragana(ch);
+        toks.push_back({ch, norm});
+    }
+    return toks;
+}
+
 }  // namespace
 
-ScoreResult scoreTranscript(const std::string& reference, const std::string& hypothesis) {
-    const auto R = tokenize(reference);
-    const auto H = tokenize(hypothesis);
+ScoreResult scoreTranscript(const std::string& reference, const std::string& hypothesis, Lang lang) {
+    const auto R = lang == Lang::Ja ? tokenizeJa(reference) : tokenize(reference);
+    const auto H = lang == Lang::Ja ? tokenizeJa(hypothesis) : tokenize(hypothesis);
     const size_t n = R.size(), m = H.size();
 
     // 편집 거리 DP (치환/삽입/삭제 비용 1)

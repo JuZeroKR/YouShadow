@@ -26,14 +26,18 @@ std::optional<std::string> extractVideoId(const std::string& input) {
     return std::nullopt;
 }
 
-static std::string findSubtitle(const std::string& dir) {
-    // video.en.json3 / video.en-orig.json3 / (구버전) audio.en.json3 등을 찾는다.
+static std::string findSubtitle(const std::string& dir, Lang lang) {
+    // video.en.json3 / video.en-orig.json3 / (구버전) audio.en.json3 등을 찾는다. 일본어는 .ja.*
+    const std::string code = langCode(lang);
+    const std::string manualSuffix = "." + code + ".json3";
     std::string best;
     for (const auto& e : fs::directory_iterator(dir)) {
         if (e.path().extension() != ".json3") continue;
         const auto name = e.path().filename().string();
+        if (name.find("." + code) == std::string::npos) continue;  // 다른 언어 자막은 건너뛴다
         // 수동 자막(.en.json3)이 있으면 자동 자막(en-orig)보다 우선한다.
-        const bool manual = name.size() > 9 && name.compare(name.size() - 9, 9, ".en.json3") == 0;
+        const bool manual = name.size() > manualSuffix.size() &&
+                            name.compare(name.size() - manualSuffix.size(), manualSuffix.size(), manualSuffix) == 0;
         if (best.empty() || manual) best = e.path().string();
     }
     return best;
@@ -48,11 +52,23 @@ static std::string readTitle(const std::string& dir) {
 
 std::string logPath() { return paths::logDir() + "/tools.log"; }
 
-DownloadResult download(const std::string& videoId, const std::string& dir) {
+DownloadResult download(const std::string& videoId, const std::string& dir, Lang lang) {
     fs::create_directories(dir);
     const std::string video = dir + "/video.mp4";
     const std::string audio = dir + "/audio.wav";
     const std::string log = logPath();
+    const char* subLangs = lang == Lang::Ja ? "ja,ja-orig,ja-JP" : "en,en-orig,en-US,en-GB";
+
+    // 영상은 있는데 이 언어의 자막이 없으면 자막만 다시 받는다
+    if (fs::exists(video) && findSubtitle(dir, lang).empty()) {
+        std::string cmd =
+            "yt-dlp --no-playlist -i --skip-download "
+            "--write-subs --write-auto-subs --sub-langs \"" + std::string(subLangs) + "\" --sub-format json3 "
+            "--sleep-subtitles 2 "
+            "-o \"" + dir + "/video.%(ext)s\" "
+            "\"https://www.youtube.com/watch?v=" + videoId + "\"";
+        paths::runCommand(cmd, log);
+    }
 
     if (!fs::exists(video)) {
         // -i: 자막 다운로드가 실패해도(유튜브가 자막 요청을 429 로 막는 경우가 잦다) 영상은 받는다.
@@ -61,7 +77,7 @@ DownloadResult download(const std::string& videoId, const std::string& dir) {
             "yt-dlp --no-playlist -i "
             "-f \"bv*[height<=720][ext=mp4]+ba[ext=m4a]/b[height<=720][ext=mp4]/b\" "
             "--merge-output-format mp4 "
-            "--write-subs --write-auto-subs --sub-langs \"en,en-orig,en-US,en-GB\" --sub-format json3 "
+            "--write-subs --write-auto-subs --sub-langs \"" + std::string(subLangs) + "\" --sub-format json3 "
             "--sleep-subtitles 2 "
             "--print-to-file \"%(title)s\" \"" + dir + "/title.txt\" "
             "-o \"" + dir + "/video.%(ext)s\" "
@@ -86,7 +102,7 @@ DownloadResult download(const std::string& videoId, const std::string& dir) {
     DownloadResult r;
     r.videoPath = video;
     r.audioPath = audio;
-    r.subtitlePath = findSubtitle(dir);
+    r.subtitlePath = findSubtitle(dir, lang);
     r.title = readTitle(dir);
     return r;
 }

@@ -9,15 +9,16 @@ namespace {
 
 struct TtsImpl {
     AVSpeechSynthesizer* synth = nil;
-    AVSpeechSynthesisVoice* voice = nil;
+    AVSpeechSynthesisVoice* voiceEn = nil;
+    AVSpeechSynthesisVoice* voiceJa = nil;
     float volume = 1.0f;
 };
 
-// 영어(en-US 우선) 음성을 찾는다
-AVSpeechSynthesisVoice* findEnglishVoice() {
-    if (AVSpeechSynthesisVoice* v = [AVSpeechSynthesisVoice voiceWithLanguage:@"en-US"]) return v;
+// 언어(en-US / ja-JP 우선, 없으면 같은 언어 아무 음성) 음성을 찾는다
+AVSpeechSynthesisVoice* findVoice(NSString* preferred, NSString* prefix) {
+    if (AVSpeechSynthesisVoice* v = [AVSpeechSynthesisVoice voiceWithLanguage:preferred]) return v;
     for (AVSpeechSynthesisVoice* v in [AVSpeechSynthesisVoice speechVoices]) {
-        if ([v.language hasPrefix:@"en"]) return v;
+        if ([v.language hasPrefix:prefix]) return v;
     }
     return nil;
 }
@@ -29,7 +30,8 @@ Tts::~Tts() {
         auto* p = (TtsImpl*)voice_;
         [p->synth stopSpeakingAtBoundary:AVSpeechBoundaryImmediate];
         [p->synth release];
-        [p->voice release];
+        [p->voiceEn release];
+        [p->voiceJa release];
         delete p;
         voice_ = nullptr;
     }
@@ -42,20 +44,30 @@ bool Tts::init() {
         delete p;
         return false;
     }
-    p->voice = [findEnglishVoice() retain];
-    if (p->voice && p->voice.name) voiceName_ = [p->voice.name UTF8String];
+    p->voiceEn = [findVoice(@"en-US", @"en") retain];
+    p->voiceJa = [findVoice(@"ja-JP", @"ja") retain];
+    if (p->voiceEn && p->voiceEn.name) voiceNameEn_ = [p->voiceEn.name UTF8String];
+    if (p->voiceJa && p->voiceJa.name) voiceNameJa_ = [p->voiceJa.name UTF8String];
     voice_ = p;
     return true;
 }
 
-void Tts::speak(const std::string& text, int rate) {
+bool Tts::hasVoice(Lang lang) const {
+    if (!voice_) return false;
+    auto* p = (TtsImpl*)voice_;
+    return lang == Lang::Ja ? p->voiceJa != nil : p->voiceEn != nil;
+}
+
+void Tts::speak(const std::string& text, int rate, Lang lang) {
     if (!voice_ || text.empty()) return;
     auto* p = (TtsImpl*)voice_;
     [p->synth stopSpeakingAtBoundary:AVSpeechBoundaryImmediate];
     NSString* s = [NSString stringWithUTF8String:text.c_str()];
     if (!s) return;
     AVSpeechUtterance* u = [AVSpeechUtterance speechUtteranceWithString:s];
-    if (p->voice) u.voice = p->voice;
+    AVSpeechSynthesisVoice* v = lang == Lang::Ja ? p->voiceJa : p->voiceEn;
+    if (!v) v = p->voiceEn ? p->voiceEn : p->voiceJa;
+    if (v) u.voice = v;
     // SAPI 의 -10~10 을 AVSpeech 의 0~1 로 맞춘다 (0 → 기본 0.5)
     u.rate = AVSpeechUtteranceDefaultSpeechRate + std::clamp(rate, -10, 10) * 0.04f;
     u.volume = p->volume;

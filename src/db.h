@@ -29,6 +29,7 @@ struct SegmentState {
 struct ReviewItem {
     std::string videoId;
     std::string title;
+    Lang lang = Lang::En;
     int segIdx = 0;
     int startMs = 0;
     std::string text;
@@ -53,6 +54,7 @@ struct ExpressionCard {
 struct VideoSummary {
     std::string id;
     std::string title;
+    Lang lang = Lang::En;
     int durationMs = 0;
     std::string addedAt;
     std::string lastOpenedAt;
@@ -87,7 +89,9 @@ public:
     bool open(const std::string& path, std::string* err);
 
     // 영상 / 세그먼트
-    void upsertVideo(const std::string& id, const std::string& title, int durationMs);
+    void upsertVideo(const std::string& id, const std::string& title, int durationMs, Lang lang = Lang::En);
+    Lang videoLang(const std::string& id) const;          // 등록되지 않은 영상이면 En
+    bool hasVideo(const std::string& id) const;
     void upsertSegments(const std::string& id, const std::vector<Segment>& segs);
 
     // 연습 이력
@@ -126,6 +130,10 @@ public:
     // 단어 뜻 캐시 (단어 + 문장 기준, JSON)
     std::string getWordMeaning(const std::string& word, const std::string& sentence) const;
     void setWordMeaning(const std::string& word, const std::string& sentence, const std::string& json);
+
+    // 일본어 읽기(토큰 · 후리가나 · 한국어 발음) 캐시 (문장 기준, JSON)
+    std::string getReading(const std::string& videoId, int segIdx) const;
+    void setReading(const std::string& videoId, int segIdx, const std::string& json);
 
     // 표현 카드 (간격 반복 포함)
     long long addExpression(const std::string& videoId, int segIdx, const std::string& text,

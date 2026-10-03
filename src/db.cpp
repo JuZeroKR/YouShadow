@@ -64,10 +64,16 @@ CREATE TABLE IF NOT EXISTS expressions(
 CREATE INDEX IF NOT EXISTS idx_expr_due ON expressions(due_at);
 CREATE TABLE IF NOT EXISTS word_meanings(
   word TEXT, sentence TEXT, json TEXT, created_at TEXT, PRIMARY KEY(word, sentence));
+CREATE TABLE IF NOT EXISTS readings(
+  video_id TEXT, seg_idx INTEGER, json TEXT, created_at TEXT, PRIMARY KEY(video_id, seg_idx));
 )";
 
+// 스키마 버전 (PRAGMA user_version). 기존 테이블에 컬럼을 더할 때만 올린다 — 테이블 생성은 IF NOT EXISTS 로 충분하다.
+//  1: videos.lang (학습 언어, 'en' / 'ja')
+constexpr int kSchemaVersion = 1;
+
 const char* kReviewSelect =
-    "SELECT s.video_id, COALESCE(v.title, s.video_id), s.seg_idx, COALESCE(g.start_ms, 0), COALESCE(g.text, ''), COALESCE(s.due_at, '') "
+    "SELECT s.video_id, COALESCE(v.title, s.video_id), s.seg_idx, COALESCE(g.start_ms, 0), COALESCE(g.text, ''), COALESCE(s.due_at, ''), COALESCE(v.lang, 'en') "
     "FROM segment_state s "
     "LEFT JOIN segments g ON g.video_id = s.video_id AND g.idx = s.seg_idx "
     "LEFT JOIN videos v ON v.id = s.video_id ";
@@ -82,6 +88,7 @@ std::vector<ReviewItem> collect(Stmt& st) {
         it.startMs = st.colInt(3);
         it.text = st.colText(4);
         it.dueAt = st.colText(5);
+        it.lang = langFromCode(st.colText(6));
         out.push_back(it);
     }
     return out;
@@ -110,6 +117,16 @@ bool Db::open(const std::string& path, std::string* err) {
     try {
         exec("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;");
         exec(kSchema);
+        // 마이그레이션: 기존 사용자의 DB 에 컬럼을 더한다 (데이터는 그대로)
+        int ver = 0;
+        { Stmt st(db_, "PRAGMA user_version"); if (st.step()) ver = st.colInt(0); }
+        if (ver < 1) {
+            bool hasLang = false;
+            Stmt st(db_, "PRAGMA table_info(videos)");
+            while (st.step()) if (st.colText(1) == "lang") hasLang = true;
+            if (!hasLang) exec("ALTER TABLE videos ADD COLUMN lang TEXT DEFAULT 'en'");
+        }
+        if (ver < kSchemaVersion) exec("PRAGMA user_version=" + std::to_string(kSchemaVersion));
     } catch (const std::exception& e) {
         if (err) *err = e.what();
         return false;
@@ -119,10 +136,22 @@ bool Db::open(const std::string& path, std::string* err) {
 
 // ---------------- 영상 / 세그먼트 ----------------
 
-void Db::upsertVideo(const std::string& id, const std::string& title, int durationMs) {
-    Stmt(db_, "INSERT INTO videos(id, title, duration_ms, added_at, last_opened_at) VALUES(?,?,?,?,?) "
-              "ON CONFLICT(id) DO UPDATE SET title=excluded.title, duration_ms=excluded.duration_ms, last_opened_at=excluded.last_opened_at")
-        .bind(1, id).bind(2, title).bind(3, durationMs).bind(4, now()).bind(5, now()).run();
+void Db::upsertVideo(const std::string& id, const std::string& title, int durationMs, Lang lang) {
+    Stmt(db_, "INSERT INTO videos(id, title, duration_ms, added_at, last_opened_at, lang) VALUES(?,?,?,?,?,?) "
+              "ON CONFLICT(id) DO UPDATE SET title=excluded.title, duration_ms=excluded.duration_ms, last_opened_at=excluded.last_opened_at, lang=excluded.lang")
+        .bind(1, id).bind(2, title).bind(3, durationMs).bind(4, now()).bind(5, now()).bind(6, std::string(langCode(lang))).run();
+}
+
+bool Db::hasVideo(const std::string& id) const {
+    Stmt st(db_, "SELECT 1 FROM videos WHERE id=?");
+    st.bind(1, id);
+    return st.step();
+}
+
+Lang Db::videoLang(const std::string& id) const {
+    Stmt st(db_, "SELECT COALESCE(lang, 'en') FROM videos WHERE id=?");
+    st.bind(1, id);
+    return st.step() ? langFromCode(st.colText(0)) : Lang::En;
 }
 
 void Db::upsertSegments(const std::string& id, const std::vector<Segment>& segs) {
@@ -263,13 +292,15 @@ std::vector<VideoSummary> Db::videos() const {
         " (SELECT COUNT(*) FROM practices p WHERE p.video_id = v.id), "
         " (SELECT AVG(p.score) FROM practices p WHERE p.video_id = v.id AND p.score IS NOT NULL), "
         " (SELECT COALESCE(MAX(p.at), '') FROM practices p WHERE p.video_id = v.id), "
-        " (SELECT COUNT(*) FROM segment_state s WHERE s.video_id = v.id AND s.due_at IS NOT NULL AND s.due_at <= ?) "
+        " (SELECT COUNT(*) FROM segment_state s WHERE s.video_id = v.id AND s.due_at IS NOT NULL AND s.due_at <= ?), "
+        " COALESCE(v.lang, 'en') "
         "FROM videos v ORDER BY v.last_opened_at DESC");
     st.bind(1, now());
     while (st.step()) {
         VideoSummary v;
         v.id = st.colText(0);
         v.title = st.colText(1);
+        v.lang = langFromCode(st.colText(11));
         v.durationMs = st.colInt(2);
         v.addedAt = st.colText(3);
         v.lastOpenedAt = st.colText(4);
@@ -365,6 +396,17 @@ void Db::setWordMeaning(const std::string& word, const std::string& sentence, co
         .bind(1, word).bind(2, sentence).bind(3, json).bind(4, now()).run();
 }
 
+std::string Db::getReading(const std::string& videoId, int segIdx) const {
+    Stmt st(db_, "SELECT json FROM readings WHERE video_id=? AND seg_idx=?");
+    st.bind(1, videoId).bind(2, segIdx);
+    return st.step() ? st.colText(0) : "";
+}
+
+void Db::setReading(const std::string& videoId, int segIdx, const std::string& json) {
+    Stmt(db_, "INSERT OR REPLACE INTO readings(video_id, seg_idx, json, created_at) VALUES(?,?,?,?)")
+        .bind(1, videoId).bind(2, segIdx).bind(3, json).bind(4, now()).run();
+}
+
 std::set<int> Db::explainedSegments(const std::string& videoId) const {
     std::set<int> out;
     Stmt st(db_, "SELECT seg_idx FROM explanations WHERE video_id=?");
@@ -418,7 +460,7 @@ std::vector<ExpressionCard> Db::expressions(int limit) const {
 std::vector<ReviewItem> Db::dueExpressions(int limit) const {
     std::vector<ReviewItem> out;
     Stmt st(db_, "SELECT e.id, e.video_id, COALESCE(v.title, e.video_id), e.seg_idx, COALESCE(g.start_ms, 0), COALESCE(g.text, ''), "
-                 "e.due_at, e.text, e.meaning, e.note, e.example "
+                 "e.due_at, e.text, e.meaning, e.note, e.example, COALESCE(v.lang, 'en') "
                  "FROM expressions e LEFT JOIN segments g ON g.video_id=e.video_id AND g.idx=e.seg_idx "
                  "LEFT JOIN videos v ON v.id=e.video_id "
                  "WHERE e.due_at IS NOT NULL AND e.due_at <= ? ORDER BY e.due_at LIMIT ?");
@@ -436,6 +478,7 @@ std::vector<ReviewItem> Db::dueExpressions(int limit) const {
         it.meaning = st.colText(8);
         it.note = st.colText(9);
         it.example = st.colText(10);
+        it.lang = langFromCode(st.colText(11));
         if (it.example.empty()) it.example = sentence;  // 예문이 없으면 원문 문장
         out.push_back(it);
     }

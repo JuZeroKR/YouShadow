@@ -2,7 +2,9 @@
 #include <string>
 #include <vector>
 
-// 원문(reference)과 인식 결과(hypothesis)를 단어 단위로 정렬해 채점한다.
+#include "lang.h"
+
+// 원문(reference)과 인식 결과(hypothesis)를 단어 단위로 정렬해 채점한다. (일본어는 글자 단위)
 struct WordMark {
     enum Kind { Match, Missing, Wrong, Extra };
     std::string text;   // 원문 단어 (Extra 면 인식된 단어)
@@ -18,4 +20,4 @@ struct ScoreResult {
     std::vector<WordMark> marks;
 };
 
-ScoreResult scoreTranscript(const std::string& reference, const std::string& hypothesis);
+ScoreResult scoreTranscript(const std::string& reference, const std::string& hypothesis, Lang lang = Lang::En);

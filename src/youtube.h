@@ -2,6 +2,8 @@
 #include <string>
 #include <optional>
 
+#include "lang.h"
+
 namespace yt {
 
 // URL 또는 11자리 ID에서 유튜브 영상 ID를 뽑는다. 실패하면 nullopt.
@@ -16,7 +18,7 @@ struct DownloadResult {
 
 // yt-dlp로 영상과 영어 자막을 dir 아래에 받고 ffmpeg로 wav를 뽑는다.
 // 이미 있으면 다시 받지 않는다.
-DownloadResult download(const std::string& videoId, const std::string& dir);
+DownloadResult download(const std::string& videoId, const std::string& dir, Lang lang = Lang::En);
 
 // 외부 도구(yt-dlp, ffmpeg, curl) 출력이 기록되는 로그 파일
 std::string logPath();

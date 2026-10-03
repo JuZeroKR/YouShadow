@@ -43,12 +43,13 @@ void copySubtitle(const std::string& subtitlePath, const std::string& dir) {
     fs::copy_file(src, dst, fs::copy_options::overwrite_existing);
 }
 
-// 영상 안에 든 자막 트랙(영어 우선) 을 srt 로 뽑는다. 없으면 빈 문자열.
-std::string extractEmbedded(const std::string& videoPath, const std::string& dir) {
+// 영상 안에 든 자막 트랙(학습 언어 우선) 을 srt 로 뽑는다. 없으면 빈 문자열.
+std::string extractEmbedded(const std::string& videoPath, const std::string& dir, Lang lang) {
     const std::string out = dir + "/subtitle.srt";
     const std::string log = yt::logPath();
-    const char* maps[] = {"0:s:m:language:eng", "0:s:m:language:en", "0:s:0"};
-    for (const char* map : maps) {
+    const char* mapsEn[] = {"0:s:m:language:eng", "0:s:m:language:en", "0:s:0"};
+    const char* mapsJa[] = {"0:s:m:language:jpn", "0:s:m:language:ja", "0:s:0"};
+    for (const char* map : (lang == Lang::Ja ? mapsJa : mapsEn)) {
         std::string cmd = "ffmpeg -y -loglevel error -i \"" + videoPath + "\" -map " + map + " -c:s srt \"" + out + "\"";
         int rc = paths::runCommand(cmd, log);
         std::error_code ec;
@@ -97,7 +98,7 @@ std::string makeId(const std::string& videoPath) {
     return buf;
 }
 
-std::string findSiblingSubtitle(const std::string& videoPath) {
+std::string findSiblingSubtitle(const std::string& videoPath, Lang lang) {
     fs::path v = fs::u8path(videoPath);
     std::error_code ec;
     if (!fs::exists(v, ec)) return "";
@@ -108,20 +109,24 @@ std::string findSiblingSubtitle(const std::string& videoPath) {
         if (!e.is_regular_file(ec)) continue;
         const std::string ext = u8(e.path().extension());
         if (!subtitle::isSubtitleExt(ext)) continue;
-        const std::string name = lower(u8(e.path().stem()));  // "movie", "movie.en", "movie.eng"
+        const std::string name = lower(u8(e.path().stem()));  // "movie", "movie.en", "movie.eng", "movie.ja"
         if (name != stem && name.rfind(stem + ".", 0) != 0) continue;
+        const std::string tag = name == stem ? "" : name.substr(stem.size());  // ".en" 등
+        const bool wantJa = lang == Lang::Ja;
+        const bool isEn = tag.find(".en") != std::string::npos;
+        const bool isJa = tag.find(".ja") != std::string::npos || tag.find(".jp") != std::string::npos;
+        const bool isKo = tag.find(".ko") != std::string::npos;
         int score = 0;
-        if (name == stem) score = 2;
-        else if (name.find(".en") != std::string::npos || name.find(".eng") != std::string::npos) score = 3;
-        else if (name.find(".ko") != std::string::npos || name.find(".kor") != std::string::npos) score = 0;
+        if (tag.empty()) score = 2;                       // 같은 이름 (언어 표시 없음)
+        else if (wantJa ? isJa : isEn) score = 3;         // 학습 언어 표시
+        else if (isKo || (wantJa ? isEn : isJa)) score = 0;  // 다른 언어
         else score = 1;
-        if (lower(ext) == ".smi") score += 0;  // 형식 선호 없음
         if (score > bestScore) { bestScore = score; best = u8(e.path()); }
     }
     return best;
 }
 
-Prepared prepare(const std::string& videoPath, const std::string& subtitlePath, const std::string& dir) {
+Prepared prepare(const std::string& videoPath, const std::string& subtitlePath, const std::string& dir, Lang lang) {
     fs::path v = fs::u8path(videoPath);
     std::error_code ec;
     if (!fs::exists(v, ec)) throw std::runtime_error("영상 파일이 없습니다: " + videoPath);
@@ -140,14 +145,14 @@ Prepared prepare(const std::string& videoPath, const std::string& subtitlePath, 
     }
     if (!subtitlePath.empty()) copySubtitle(subtitlePath, dir);
     p.subtitlePath = existingSubtitle(dir);
-    if (p.subtitlePath.empty()) p.subtitlePath = extractEmbedded(p.videoPath, dir);
+    if (p.subtitlePath.empty()) p.subtitlePath = extractEmbedded(p.videoPath, dir, lang);
 
     p.audioPath = dir + "/audio.wav";
     extractAudio(p.videoPath, p.audioPath);
     return p;
 }
 
-Prepared reopen(const std::string& dir) {
+Prepared reopen(const std::string& dir, Lang lang) {
     std::string src = readSource(dir);
     if (src.empty()) throw std::runtime_error("등록된 영상 파일 경로를 찾을 수 없습니다 (source.txt 없음)");
     std::error_code ec;
@@ -158,6 +163,7 @@ Prepared reopen(const std::string& dir) {
     p.videoPath = src;
     p.title = u8(fs::u8path(src).stem());
     p.subtitlePath = existingSubtitle(dir);
+    if (p.subtitlePath.empty()) p.subtitlePath = extractEmbedded(p.videoPath, dir, lang);
     p.audioPath = dir + "/audio.wav";
     extractAudio(p.videoPath, p.audioPath);
     return p;

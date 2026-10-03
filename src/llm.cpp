@@ -197,6 +197,8 @@ std::string Explanation::toJson() const {
     json j;
     j["translation"] = translation;
     j["grammar"] = grammar;
+    if (!reading.empty()) j["reading"] = reading;
+    if (!pronunciation.empty()) j["pronunciation"] = pronunciation;
     j["provider"] = provider;
     j["model"] = model;
     j["expressions"] = json::array();
@@ -210,6 +212,8 @@ Explanation Explanation::fromJson(const std::string& s) {
         json j = json::parse(s);
         ex.translation = j.value("translation", "");
         ex.grammar = j.value("grammar", "");
+        ex.reading = j.contains("reading") && j["reading"].is_string() ? j["reading"].get<std::string>() : "";
+        ex.pronunciation = j.contains("pronunciation") && j["pronunciation"].is_string() ? j["pronunciation"].get<std::string>() : "";
         ex.provider = j.value("provider", "");
         ex.model = j.value("model", "");
         if (j.contains("expressions") && j["expressions"].is_array()) {
@@ -239,12 +243,27 @@ static const char* kSystemPrompt =
     "words used in a non-obvious sense. Skip trivial words and proper nouns. "
     "Write meaning/note/grammar in Korean; keep text/example in English.";
 
+static const char* kSystemPromptJa =
+    "You are a Japanese tutor helping a Korean learner study spoken Japanese from YouTube videos. "
+    "The learner cannot read kanji well, so readings and Korean pronunciation matter. "
+    "You will get one sentence plus the sentences before and after it for context. "
+    "Respond with ONLY a JSON object, no markdown, in this exact shape:\n"
+    "{\"translation\": \"자연스러운 한국어 번역\", "
+    "\"reading\": \"문장 전체를 히라가나로 (한자를 모두 읽기로 바꾼 것, 띄어쓰기로 단어 구분)\", "
+    "\"pronunciation\": \"문장 전체의 한국어 발음 표기 (예: 와타시와 가쿠세이데스)\", "
+    "\"expressions\": [{\"text\": \"표현 원문 (문장에 나온 그대로)\", \"meaning\": \"한국어 뜻\", "
+    "\"note\": \"뉘앙스, 쓰임새, 경어 수준을 한국어로 1~2문장. 읽기(히라가나)도 함께\", \"example\": \"그 표현을 쓴 짧은 일본어 예문 하나\"}], "
+    "\"grammar\": \"문형이나 문법 포인트를 한국어로 1~2문장. 특별한 것이 없으면 빈 문자열\"}\n"
+    "Pick 1 to 5 expressions worth learning: set phrases, grammar patterns, verb conjugations, spoken contractions, "
+    "words used in a non-obvious sense. Skip trivial particles and proper nouns. "
+    "Write meaning/note/grammar in Korean; keep text/example in Japanese.";
+
 Explanation explainSentence(const LlmConfig& cfg, const std::string& sentence,
-                            const std::string& before, const std::string& after, std::string* err) {
+                            const std::string& before, const std::string& after, std::string* err, Lang lang) {
     std::string user = "Context before: " + (before.empty() ? std::string("(none)") : before) +
                        "\nSentence: " + sentence +
                        "\nContext after: " + (after.empty() ? std::string("(none)") : after);
-    std::string text = llmComplete(cfg, kSystemPrompt, user, err);
+    std::string text = llmComplete(cfg, lang == Lang::Ja ? kSystemPromptJa : kSystemPrompt, user, err);
     Explanation ex;
     if (text.empty()) return ex;
     ex = Explanation::fromJson(extractJson(text));
@@ -267,6 +286,8 @@ std::string WordMeaning::toJson() const {
     j["meaning"] = meaning;
     j["context"] = contextMeaning;
     j["example"] = example;
+    if (!reading.empty()) j["reading"] = reading;
+    if (!korean.empty()) j["korean"] = korean;
     j["provider"] = provider;
     j["model"] = model;
     return j.dump();
@@ -283,11 +304,25 @@ WordMeaning WordMeaning::fromJson(const std::string& s) {
         w.meaning = str("meaning");
         w.contextMeaning = str("context");
         w.example = str("example");
+        w.reading = str("reading");
+        w.korean = str("korean");
         w.provider = str("provider");
         w.model = str("model");
     } catch (...) {}
     return w;
 }
+
+static const char* kWordPromptJa =
+    "You are a Japanese tutor helping a Korean learner who cannot read kanji well. The learner clicked one word in a sentence from a YouTube video. "
+    "Respond with ONLY a JSON object, no markdown, in this exact shape:\n"
+    "{\"word\": \"기본형 (예: 食べました → 食べる, 조사나 고유명사는 그대로)\", "
+    "\"reading\": \"그 단어(문장에 나온 형태)의 읽기를 히라가나로\", "
+    "\"korean\": \"그 읽기의 한국어 발음 표기 (예: 타베마시타)\", "
+    "\"pos\": \"품사를 한국어로 (명사/동사/い형용사/な형용사/부사/조사/조동사 등)\", "
+    "\"meaning\": \"대표적인 뜻을 한국어로, 쉼표로 구분한 1~3개\", "
+    "\"context\": \"이 문장에서는 어떤 뜻·활용으로 쓰였는지 한국어로 1~2문장. 활용형이면 기본형과 활용을 알려줄 것\", "
+    "\"example\": \"그 단어를 같은 뜻으로 쓴 짧은 일본어 예문 하나 (뒤에 괄호로 한국어 발음)\"}\n"
+    "Write meaning/context in Korean; keep word/example in Japanese. Be concise.";
 
 static const char* kWordPrompt =
     "You are an English tutor helping a Korean learner. The learner clicked one word in a sentence from a YouTube video. "
@@ -300,9 +335,9 @@ static const char* kWordPrompt =
     "\"example\": \"그 단어를 같은 뜻으로 쓴 짧은 영어 예문 하나\"}\n"
     "Write meaning/context in Korean; keep word/example in English. Be concise.";
 
-WordMeaning explainWord(const LlmConfig& cfg, const std::string& word, const std::string& sentence, std::string* err) {
+WordMeaning explainWord(const LlmConfig& cfg, const std::string& word, const std::string& sentence, std::string* err, Lang lang) {
     std::string user = "Sentence: " + sentence + "\nClicked word: " + word;
-    std::string text = llmComplete(cfg, kWordPrompt, user, err);
+    std::string text = llmComplete(cfg, lang == Lang::Ja ? kWordPromptJa : kWordPrompt, user, err);
     WordMeaning w;
     if (text.empty()) return w;
     w = WordMeaning::fromJson(extractJson(text));
@@ -352,8 +387,9 @@ static std::string htmlToText(std::string html) {
     return s;
 }
 
-WordMeaning lookupDictionary(const std::string& word, std::string* err) {
-    // Wiktionary (영어) 정의 API. 소문자로 먼저 찾고, 없으면 원래 표기로 다시 찾는다.
+WordMeaning lookupDictionary(const std::string& word, std::string* err, Lang lang) {
+    // Wiktionary(영어판) 정의 API. 응답은 언어 코드별("en", "ja")로 묶여 온다. 소문자로 먼저 찾고, 없으면 원래 표기로 다시 찾는다.
+    const std::string key = langCode(lang);
     auto fetch = [&](const std::string& w, std::string* e) {
         std::string enc;
         for (unsigned char c : w) {
@@ -374,10 +410,13 @@ WordMeaning lookupDictionary(const std::string& word, std::string* err) {
     if (r.status != 200) { if (err) *err = "사전 응답 오류 (HTTP " + std::to_string(r.status) + ")"; return w; }
     try {
         json j = json::parse(r.body);
-        if (!j.contains("en") || !j["en"].is_array()) throw std::runtime_error("no english entry");
+        if (!j.contains(key) || !j[key].is_array()) {
+            if (err) *err = std::string("사전에 ") + langName(lang) + " 항목이 없습니다: " + word;
+            return WordMeaning();
+        }
         std::string meanings;
         int nPos = 0, nTotal = 0;
-        for (const auto& entry : j["en"]) {
+        for (const auto& entry : j[key]) {
             if (nTotal >= 5) break;
             std::string pos = entry.value("partOfSpeech", "");
             if (!entry.contains("definitions") || !entry["definitions"].is_array()) continue;
@@ -407,4 +446,89 @@ WordMeaning lookupDictionary(const std::string& word, std::string* err) {
     }
     if (w.empty() && err) *err = "사전에 영어 정의가 없습니다: " + word;
     return w;
+}
+
+// ---------------- 일본어 읽기 ----------------
+
+std::string JaReading::toJson() const {
+    json j;
+    j["reading"] = reading;
+    j["pronunciation"] = pronunciation;
+    j["provider"] = provider;
+    j["model"] = model;
+    j["tokens"] = json::array();
+    for (const auto& t : tokens) j["tokens"].push_back({{"surface", t.surface}, {"reading", t.reading}, {"korean", t.korean}, {"meaning", t.meaning}});
+    return j.dump();
+}
+
+JaReading JaReading::fromJson(const std::string& s) {
+    JaReading r;
+    try {
+        json j = json::parse(s);
+        auto str = [](const json& o, const char* k) { return o.contains(k) && o[k].is_string() ? o[k].get<std::string>() : std::string(); };
+        r.reading = str(j, "reading");
+        r.pronunciation = str(j, "pronunciation");
+        r.provider = str(j, "provider");
+        r.model = str(j, "model");
+        if (j.contains("tokens") && j["tokens"].is_array()) {
+            for (const auto& t : j["tokens"]) {
+                if (!t.is_object()) continue;
+                JaToken tk{str(t, "surface"), str(t, "reading"), str(t, "korean"), str(t, "meaning")};
+                if (!tk.surface.empty()) r.tokens.push_back(tk);
+            }
+        }
+    } catch (...) {}
+    return r;
+}
+
+static const char* kReadingPrompt =
+    "You help a Korean learner who cannot read kanji follow spoken Japanese. Split the given Japanese sentence into words "
+    "(not characters; keep particles as their own tokens, keep a verb with its conjugation as one token). "
+    "Respond with ONLY a JSON object, no markdown, in this exact shape:\n"
+    "{\"reading\": \"문장 전체 읽기를 히라가나로, 단어 사이 띄어쓰기\", "
+    "\"pronunciation\": \"문장 전체의 한국어 발음 표기, 단어 사이 띄어쓰기 (예: 와타시와 가쿠세이 데스)\", "
+    "\"tokens\": [{\"surface\": \"문장에 나온 그대로\", \"reading\": \"히라가나 읽기 (가타카나 단어도 히라가나로)\", "
+    "\"korean\": \"한국어 발음\", \"meaning\": \"짧은 한국어 뜻 (조사는 '조사(~은/는)' 식으로)\"}]}\n"
+    "The surfaces, concatenated in order, must reproduce the sentence exactly except for spaces and punctuation. "
+    "Korean pronunciation conventions: か=카 た=타 つ=츠 ふ=후, っ=받침 ㅅ, ん=받침 ㄴ, long vowels not doubled.";
+
+JaReading readJapanese(const LlmConfig& cfg, const std::string& sentence, std::string* err) {
+    std::string text = llmComplete(cfg, kReadingPrompt, "Sentence: " + sentence, err);
+    JaReading r;
+    if (text.empty()) return r;
+    r = JaReading::fromJson(extractJson(text));
+    if (r.empty()) {
+        if (err) *err = "읽기 형식을 읽지 못했습니다: " + text.substr(0, 200);
+        return r;
+    }
+    // 토큰에 발음이 비어 있으면 읽기에서 만들어 채운다
+    for (auto& t : r.tokens) if (t.korean.empty() && !t.reading.empty()) t.korean = jp::kanaToKorean(t.reading);
+    if (r.pronunciation.empty() && !r.reading.empty()) r.pronunciation = jp::kanaToKorean(r.reading);
+    r.provider = providerName(cfg.provider);
+    r.model = cfg.model(cfg.provider);
+    return r;
+}
+
+JaReading roughJapaneseReading(const std::string& sentence) {
+    JaReading r;
+    for (const auto& tok : jp::roughTokens(sentence)) {
+        JaToken t;
+        t.surface = tok;
+        bool kanaOnly = true;
+        for (const auto& ch : jp::splitChars(tok)) {
+            unsigned cp = jp::decodeFirst(ch);
+            if (jp::isKanji(cp)) { kanaOnly = false; break; }
+        }
+        if (kanaOnly) {
+            t.reading = jp::katakanaToHiragana(tok);
+            t.korean = jp::kanaToKorean(tok);
+        }
+        r.tokens.push_back(t);
+        if (!r.reading.empty()) { r.reading += ' '; r.pronunciation += ' '; }
+        r.reading += t.reading.empty() ? tok : t.reading;
+        r.pronunciation += t.korean.empty() ? tok : t.korean;  // 한자는 그대로 남는다
+    }
+    r.provider = "간이";
+    r.model = "스크립트 경계 분할";
+    return r;
 }

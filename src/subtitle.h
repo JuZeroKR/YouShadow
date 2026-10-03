@@ -11,7 +11,7 @@ namespace subtitle {
 
 bool isSubtitleExt(const std::string& ext);  // ".smi" ".srt" ".vtt" (대소문자 무시)
 
-// 실패하면 std::runtime_error. SMI 에 여러 언어가 있으면 영어 클래스를 고른다.
-std::vector<Word> parseFile(const std::string& path);
+// 실패하면 std::runtime_error. SMI 에 여러 언어가 있으면 학습 언어(lang) 클래스를 고른다.
+std::vector<Word> parseFile(const std::string& path, Lang lang = Lang::En);
 
 }  // namespace subtitle
