@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(YouShadow VERSION 0.7.0 LANGUAGES C CXX)
+project(YouShadow VERSION 0.7.1 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -76,6 +76,7 @@ if(WIN32)
 elseif(APPLE)
     target_link_libraries(ys_core PUBLIC
         curl
+        iconv   # subtitle.cpp: CP949 자막 변환
         "-framework Security"
         "-framework CoreFoundation"
         "-framework Foundation"
