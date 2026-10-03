@@ -179,7 +179,7 @@ std::vector<Word> blocksToWords(const std::vector<Block>& blocks) {
 // <STYLE> 에서 .CLASS { lang: en-US } 처럼 해당 언어로 선언된 클래스 이름들을 찾는다
 std::vector<std::string> classesForLang(const std::string& doc, Lang lang) {
     const std::string code = langCode(lang);
-    const std::string nameWord = lang == Lang::Ja ? "japanese" : "english";
+    const std::string nameWord = lang == Lang::Ja ? "japanese" : lang == Lang::Ko ? "korean" : "english";
     std::vector<std::string> out;
     std::string low = lower(doc);
     size_t s = low.find("<style");
@@ -229,6 +229,22 @@ double japaneseRatio(const std::string& s) {
         if (jp::isKanji(cp) || jp::isHiragana(cp) || jp::isKatakana(cp)) ++jpn;
     }
     return letters ? (double)jpn / letters : 0.0;
+}
+
+// 한국어다움: 한글 비율
+double hangulRatio(const std::string& s) {
+    int letters = 0, ko = 0;
+    for (const auto& ch : jp::splitChars(s)) {
+        unsigned cp = jp::decodeFirst(ch);
+        if (cp < 0x80 && !std::isalpha((int)cp)) continue;
+        ++letters;
+        if ((cp >= 0xAC00 && cp <= 0xD7A3) || (cp >= 0x3130 && cp <= 0x318F)) ++ko;
+    }
+    return letters ? (double)ko / letters : 0.0;
+}
+
+double langRatio(const std::string& s, Lang lang) {
+    return lang == Lang::Ja ? japaneseRatio(s) : lang == Lang::Ko ? hangulRatio(s) : asciiRatio(s);
 }
 
 std::vector<Block> parseSmi(const std::string& doc, Lang lang) {
@@ -296,9 +312,11 @@ std::vector<Block> parseSmi(const std::string& doc, Lang lang) {
     if (chosen.empty()) {
         double best = -1;
         for (const auto& [cls, text] : sample) {
-            double r = lang == Lang::Ja ? japaneseRatio(text) : asciiRatio(text);
+            double r = langRatio(text, lang);
             if (r > best) { best = r; chosen = cls; }
         }
+        // 한국어(번역)는 없을 수도 있다: 한글이 거의 없으면 고르지 않는다
+        if (lang == Lang::Ko && best < 0.3) return {};
     }
 
     std::vector<Block> blocks;
@@ -378,17 +396,155 @@ bool isSubtitleExt(const std::string& ext) {
     return e == ".smi" || e == ".sami" || e == ".srt" || e == ".vtt";
 }
 
-std::vector<Word> parseFile(const std::string& path, Lang lang) {
+namespace {
+
+std::vector<Block> readBlocks(const std::string& path, Lang lang) {
     std::string doc = readText(path);
     std::string ext = lower(fs::u8path(path).extension().u8string());
     std::string head = lower(doc.substr(0, std::min<size_t>(doc.size(), 2000)));
     std::vector<Block> blocks;
-    if (ext == ".smi" || ext == ".sami" || head.find("<sami") != std::string::npos || head.find("<sync") != std::string::npos)
+    if (ext == ".smi" || ext == ".sami" || head.find("<sami") != std::string::npos || head.find("<sync") != std::string::npos) {
         blocks = parseSmi(doc, lang);
-    else
+    } else {
         blocks = parseSrtVtt(doc);
+        if (lang == Lang::Ko) {  // 언어가 하나뿐인 SRT/VTT: 한국어 자막인지 확인
+            std::string sample;
+            for (const auto& b : blocks) { if (sample.size() > 4000) break; sample += b.text + " "; }
+            if (hangulRatio(sample) < 0.3) blocks.clear();
+        }
+    }
     std::sort(blocks.begin(), blocks.end(), [](const Block& a, const Block& b) { return a.startMs < b.startMs; });
-    return blocksToWords(blocks);
+    return blocks;
+}
+
+bool isAsciiAlpha(char c) { return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z'); }
+
+// 자막 제작 실수로 붙은 문장 부호 뒤를 띄운다: "year,it's" → "year, it's", "shot.Come" → "shot. Come", "what?I" → "what? I"
+// "U.S." "3.5" "e.g." 처럼 원래 붙여 쓰는 것은 건드리지 않는다.
+std::string tidy(const std::string& in) {
+    std::string out;
+    for (size_t i = 0; i < in.size(); ++i) {
+        char c = in[i];
+        out += c;
+        if (i == 0 || i + 1 >= in.size()) continue;
+        char prev = in[i - 1], next = in[i + 1];
+        if (c == ',' && isAsciiAlpha(prev) && isAsciiAlpha(next)) out += ' ';
+        else if (c == '.' && std::islower((unsigned char)prev) && i >= 2 && isAsciiAlpha(in[i - 2]) && std::isupper((unsigned char)next)) out += ' ';
+        else if ((c == '?' || c == '!') && isAsciiAlpha(prev) && isAsciiAlpha(next)) out += ' ';
+    }
+    return trim(out);
+}
+
+// 앞의 대사 표시 "-" 떼기
+std::string stripDash(std::string s) {
+    s = trim(s);
+    while (!s.empty() && s[0] == '-' && (s.size() == 1 || s[1] != '-')) s = trim(s.substr(1));
+    return s;
+}
+
+// 연습할 대사인가: 글자가 하나도 없는 줄("**", "♬") 과 자막 제작자 주소 줄은 뺀다
+bool isDialogue(const std::string& s) {
+    const std::string l = lower(s);
+    if (l.find("http") != std::string::npos || l.find("www.") != std::string::npos || l.find(".com") != std::string::npos) return false;
+    for (const auto& ch : jp::splitChars(s)) {
+        unsigned cp = jp::decodeFirst(ch);
+        if (cp < 0x80 ? std::isalnum((int)cp) != 0 : ((cp >= 0xAC00 && cp <= 0xD7A3) || jp::isKanji(cp) || jp::isHiragana(cp) || jp::isKatakana(cp))) return true;
+    }
+    return false;
+}
+
+// 한 장면을 대사로 나눈다. "-" 로 시작하는 장면만 " - " 에서 나눈다 ("Every year -- every" 같은 줄표는 그대로).
+std::vector<Cue> splitSpeakers(const Cue& c) {
+    std::string t = trim(c.text);
+    std::vector<std::string> parts;
+    if (!t.empty() && t[0] == '-' && (t.size() < 2 || t[1] != '-')) {
+        size_t start = 0;
+        for (size_t p; (p = t.find(" - ", start == 0 ? 1 : start)) != std::string::npos;) {
+            parts.push_back(t.substr(start, p - start));
+            start = p + 1;
+        }
+        parts.push_back(t.substr(start));
+    } else {
+        parts.push_back(t);
+    }
+    std::vector<std::string> clean;
+    for (auto& p : parts) { std::string s = tidy(stripDash(p)); if (!s.empty() && isDialogue(s)) clean.push_back(s); }
+    std::vector<Cue> out;
+    if (clean.empty()) return out;
+    size_t total = 0;
+    for (const auto& s : clean) total += s.size() + 4;
+    const int dur = std::max(200, c.endMs - c.startMs);
+    int t0 = c.startMs;
+    for (size_t i = 0; i < clean.size(); ++i) {
+        int end = i + 1 == clean.size() ? c.startMs + dur : t0 + (int)((long long)dur * (clean[i].size() + 4) / total);
+        out.push_back({t0, std::max(end, t0 + 200), clean[i]});
+        t0 = end;
+    }
+    return out;
+}
+
+}  // namespace
+
+std::vector<Word> parseFile(const std::string& path, Lang lang) {
+    return blocksToWords(readBlocks(path, lang));
+}
+
+double langScore(const std::string& path, Lang lang) {
+    try {
+        std::string sample;
+        for (const auto& b : readBlocks(path, lang)) { if (sample.size() > 8000) break; sample += b.text + " "; }
+        return langRatio(sample, lang);
+    } catch (const std::exception&) {
+        return 0.0;
+    }
+}
+
+std::vector<Cue> parseCues(const std::string& path, Lang lang) {
+    std::vector<Block> blocks;
+    if (lang == Lang::Ko) {
+        try { blocks = readBlocks(path, lang); } catch (const std::exception&) { return {}; }
+    } else {
+        blocks = readBlocks(path, lang);
+    }
+    std::vector<Cue> cues;
+    for (const auto& b : blocks) cues.push_back({b.startMs, b.endMs, b.text});
+    return cues;
+}
+
+std::vector<Segment> cuesToLines(const std::vector<Cue>& cues) {
+    std::vector<Segment> segs;
+    for (const auto& c : cues) {
+        for (const auto& line : splitSpeakers(c)) {
+            Segment s;
+            s.idx = (int)segs.size();
+            s.startMs = line.startMs;
+            s.endMs = line.endMs;
+            s.text = line.text;
+            segs.push_back(s);
+        }
+    }
+    return segs;
+}
+
+std::vector<std::string> alignLines(const std::vector<Segment>& segs, const std::vector<Cue>& other) {
+    std::vector<std::string> out(segs.size());
+    if (segs.empty()) return out;
+    for (const auto& c : other) {
+        for (const auto& line : splitSpeakers(c)) {
+            // 가장 많이 겹치는 문장 (시작 시각으로 이분 탐색 후 주변만 본다)
+            auto it = std::lower_bound(segs.begin(), segs.end(), line.startMs, [](const Segment& s, int t) { return s.endMs <= t; });
+            int best = -1, bestOv = 0;
+            for (auto j = it; j != segs.end() && j->startMs < line.endMs; ++j) {
+                int ov = std::min(j->endMs, line.endMs) - std::max(j->startMs, line.startMs);
+                if (ov > bestOv) { bestOv = ov; best = (int)(j - segs.begin()); }
+            }
+            if (best < 0) continue;
+            std::string& dst = out[best];
+            if (!dst.empty()) dst += ' ';
+            dst += line.text;
+        }
+    }
+    return out;
 }
 
 }  // namespace subtitle

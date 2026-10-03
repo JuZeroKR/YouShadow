@@ -2,6 +2,7 @@
 #include <string>
 
 #include "lang.h"
+#include "subtitle.h"
 
 // 내 PC 의 영상 파일(mkv, mp4 …) 을 유튜브 영상처럼 등록한다.
 // 영상은 복사하지 않고 원본 경로를 data/<id>/source.txt 에 적어 두며, 자막은 data/<id>/subtitle.<ext> 로 복사한다.
@@ -28,6 +29,10 @@ Prepared prepare(const std::string& videoPath, const std::string& subtitlePath, 
 
 // 다시 열기: source.txt 의 영상이 있는지 확인하고 빠진 산출물을 보충한다. 영상이 없어졌으면 throw.
 Prepared reopen(const std::string& dir, Lang lang = Lang::En);
+
+// 한국어 번역 자막: 등록된 자막(SMI 의 한국어 클래스) → 영상 옆의 name_k.srt / name.ko.srt / name.kor.smi 같은 파일 순으로 찾는다.
+// 없으면 빈 목록.
+std::vector<subtitle::Cue> koreanCues(const std::string& videoPath, const std::string& dir);
 
 // 자막 교체: 새 자막을 dir 로 복사하고 기존 segments.json 을 지운다
 void replaceSubtitle(const std::string& subtitlePath, const std::string& dir);

@@ -66,6 +66,7 @@ add_library(ys_core STATIC
     src/subtitle.cpp
     src/local.cpp
     src/jadict.cpp
+    src/endict.cpp
 )
 if(APPLE)
     target_sources(ys_core PRIVATE src/tts_mac.mm)

@@ -103,7 +103,7 @@ std::string findSiblingSubtitle(const std::string& videoPath, Lang lang) {
     std::error_code ec;
     if (!fs::exists(v, ec)) return "";
     const std::string stem = lower(u8(v.stem()));
-    std::string best;
+    std::vector<std::string> best;
     int bestScore = -1;
     for (const auto& e : fs::directory_iterator(v.parent_path(), ec)) {
         if (!e.is_regular_file(ec)) continue;
@@ -121,9 +121,17 @@ std::string findSiblingSubtitle(const std::string& videoPath, Lang lang) {
         else if (wantJa ? isJa : isEn) score = 3;         // 학습 언어 표시
         else if (isKo || (wantJa ? isEn : isJa)) score = 0;  // 다른 언어
         else score = 1;
-        if (score > bestScore) { bestScore = score; best = u8(e.path()); }
+        if (score > bestScore) { bestScore = score; best.clear(); }
+        if (score == bestScore) best.push_back(u8(e.path()));
     }
-    return best;
+    // 같은 순위가 여러 개면 (movie.smi 와 movie.srt 등) 학습 언어 글자가 가장 많은 것
+    std::string pick;
+    double bestRatio = -1;
+    for (const auto& path : best) {
+        double r = best.size() == 1 ? 1.0 : subtitle::langScore(path, lang);
+        if (r > bestRatio) { bestRatio = r; pick = path; }
+    }
+    return pick;
 }
 
 Prepared prepare(const std::string& videoPath, const std::string& subtitlePath, const std::string& dir, Lang lang) {
@@ -167,6 +175,30 @@ Prepared reopen(const std::string& dir, Lang lang) {
     p.audioPath = dir + "/audio.wav";
     extractAudio(p.videoPath, p.audioPath);
     return p;
+}
+
+std::vector<subtitle::Cue> koreanCues(const std::string& videoPath, const std::string& dir) {
+    std::vector<std::string> candidates;
+    std::string own = existingSubtitle(dir);
+    if (!own.empty()) candidates.push_back(own);
+    fs::path v = fs::u8path(videoPath);
+    std::error_code ec;
+    const std::string stem = lower(u8(v.stem()));
+    for (const auto& e : fs::directory_iterator(v.parent_path(), ec)) {
+        if (!e.is_regular_file(ec) || !subtitle::isSubtitleExt(u8(e.path().extension()))) continue;
+        const std::string name = lower(u8(e.path().stem()));
+        if (name.size() <= stem.size() || name.rfind(stem, 0) != 0) continue;
+        const char sep = name[stem.size()];
+        if (sep != '.' && sep != '_' && sep != '-') continue;
+        const std::string tag = name.substr(stem.size() + 1);
+        if (tag == "k" || tag == "ko" || tag == "kr" || tag == "kor" || tag == "korean" || tag.rfind("ko.", 0) == 0 || tag.rfind("kor.", 0) == 0)
+            candidates.push_back(u8(e.path()));
+    }
+    for (const auto& c : candidates) {
+        auto cues = subtitle::parseCues(c, Lang::Ko);
+        if (!cues.empty()) return cues;
+    }
+    return {};
 }
 
 void replaceSubtitle(const std::string& subtitlePath, const std::string& dir) {

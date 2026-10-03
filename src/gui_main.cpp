@@ -34,6 +34,7 @@
 
 #include "audio.h"
 #include "db.h"
+#include "endict.h"
 #include "jadict.h"
 #include "llm.h"
 #include "local.h"
@@ -60,6 +61,7 @@ struct LoadedVideo {
     std::string id, title, dir, videoPath, audioPath;
     Lang lang = Lang::En;
     std::vector<Segment> segs;
+    std::vector<std::string> ko;  // 문장별 한국어 자막 (내 영상 파일에 한국어 자막이 있을 때만, 없으면 비어 있음)
     std::vector<float> peaks;  // 파형용 [min,max] per 10ms
 };
 
@@ -119,8 +121,9 @@ struct Loader {
                 v.segs = transcript::load(segPath);
                 if (v.segs.empty()) {
                     if (!subtitlePath.empty()) {
+                        // 자막 파일은 장면(대사) 단위가 이미 깔끔하므로 그대로 문장으로 쓴다
                         v.segs = json3 ? transcript::parseJson3(subtitlePath, lang)
-                                       : transcript::splitWords(subtitle::parseFile(subtitlePath, lang), lang);
+                                       : subtitle::cuesToLines(subtitle::parseCues(subtitlePath, lang));
                         if (v.segs.empty()) throw std::runtime_error("자막에서 문장을 만들지 못했습니다: " + subtitlePath);
                     } else {
                         if (!stt || !stt->loaded()) {
@@ -141,6 +144,11 @@ struct Loader {
                         if (v.segs.empty()) throw std::runtime_error("음성에서 문장을 찾지 못했습니다");
                     }
                     transcript::save(v.segs, segPath);
+                }
+                if (isLocal) {
+                    setStatus("한국어 자막 찾는 중...");
+                    auto ko = local::koreanCues(v.videoPath, v.dir);
+                    if (!ko.empty()) v.ko = subtitle::alignLines(v.segs, ko);
                 }
                 setStatus("파형 분석 중...");
                 v.peaks = AudioEngine::loadPeaks(v.audioPath, kPeakBinMs);
@@ -307,6 +315,43 @@ struct App {
         });
     }
 
+    // ---- 영어 오프라인 사전 (위키낱말사전) ----
+    EnDict enDict;
+    std::atomic<bool> enReady{false};
+    bool enDictAnnounce = false;  // 사용자가 버튼으로 받았을 때만 완료 메시지
+    DictLoader enDictLoader;
+
+    void startEnDictLoad(bool download) {
+        if (enDictLoader.busy) return;
+        if (enDictLoader.th.joinable()) enDictLoader.th.join();
+        { std::lock_guard<std::mutex> lock(enDictLoader.m); enDictLoader.busy = true; enDictLoader.done = false; enDictLoader.status = download ? "영어 사전 다운로드 중 (약 " + std::to_string(EnDict::packSizeMB()) + "MB)..." : "영어 사전 로딩 중..."; }
+        enDictLoader.th = std::thread([this, download] {
+            std::string err;
+            try {
+                const std::string dir = EnDict::dir();
+                if (download && !EnDict::installed()) {
+                    fs::create_directories(fs::u8path(dir));
+                    const std::string zip = dir + "/pack.zip";
+                    std::string cmd = "curl -L --fail -o \"" + zip + "\" \"" + EnDict::packUrl() + "\"";
+                    if (paths::runCommand(cmd, yt::logPath()) != 0 || !fs::exists(fs::u8path(zip))) throw std::runtime_error("사전 다운로드 실패. 로그: " + yt::logPath());
+                    { std::lock_guard<std::mutex> lock(enDictLoader.m); enDictLoader.status = "영어 사전 압축 해제 중..."; }
+                    if (paths::runCommand("tar -xf \"" + zip + "\" -C \"" + dir + "\"", yt::logPath()) != 0 || !EnDict::installed()) throw std::runtime_error("사전 압축 해제 실패. 로그: " + yt::logPath());
+                    std::error_code ec;
+                    fs::remove(fs::u8path(zip), ec);
+                }
+                { std::lock_guard<std::mutex> lock(enDictLoader.m); enDictLoader.status = "영어 사전 로딩 중..."; }
+                if (!enDict.load(&err)) throw std::runtime_error(err);
+            } catch (const std::exception& e) {
+                err = e.what();
+            }
+            std::lock_guard<std::mutex> lock(enDictLoader.m);
+            enDictLoader.busy = false;
+            enDictLoader.done = true;
+            enDictLoader.ok = err.empty();
+            enDictLoader.status = enDictLoader.ok ? "" : "영어 사전 오류: " + err;
+        });
+    }
+
     Lang curLang() const { return loaded ? video.lang : uiLang; }
     Stt& sttFor(Lang l) { return l == Lang::Ja ? sttJa : sttEn; }
     SttLoader& sttLoaderFor(Lang l) { return l == Lang::Ja ? sttLoaderJa : sttLoaderEn; }
@@ -430,7 +475,9 @@ struct App {
         std::string word, sentence;          // 진행 중인 요청
         WordMeaning result;
         std::string err;
+        bool ai = false;                     // 진행 중인 요청이 AI 인지 (아니면 온라인 위키낱말사전)
         bool hasPending = false;             // 진행 중에 다른 단어를 클릭하면 끝난 뒤 이어서 찾는다
+        bool pendingAi = false;
         std::string pendingWord, pendingSentence;
         ~WordJob() { if (th.joinable()) th.join(); }
     } wordJob;
@@ -469,6 +516,17 @@ struct App {
     std::set<int> readingRequested;          // 자동 요청 중복 방지
     std::vector<int> readingPending;         // 작업 중에 들어온 요청
     bool showPron = true;                    // 자막 아래 한국어 발음 표시
+    bool showKo = true;                      // 한국어 자막 표시 (내 영상 파일에 한국어 자막이 있을 때)
+
+    // 문장 i 의 한국어 자막 (끄거나 없으면 빈 문자열)
+    const std::string& koFor(int i) const {
+        static const std::string none;
+        return showKo && i >= 0 && i < (int)video.ko.size() ? video.ko[i] : none;
+    }
+    void setShowKo(bool on) {
+        showKo = on;
+        db.setSetting("sub.showKo", on ? "1" : "0");
+    }
 
     // 읽기 우선순위: AI 가 만든 것(DB) → 오프라인 사전 → 가나만 변환한 간이 읽기. AI 는 자동으로 부르지 않는다 (토큰 비용).
     const JaReading& readingFor(int i) {
@@ -740,6 +798,7 @@ struct App {
         ttsSlow = db.getSetting("tts.slow", "0") == "1";
         uiLang = langFromCode(db.getSetting("ui.lang", "en"));
         showPron = db.getSetting("ja.showPron", "1") == "1";
+        showKo = db.getSetting("sub.showKo", "1") == "1";
         snprintf(keyBuf[0], sizeof keyBuf[0], "%s", llm.claudeKey.c_str());
         snprintf(keyBuf[1], sizeof keyBuf[1], "%s", llm.openaiKey.c_str());
         snprintf(keyBuf[2], sizeof keyBuf[2], "%s", llm.geminiKey.c_str());
@@ -1198,6 +1257,20 @@ struct App {
                 }
             }
         }
+        // 영어 사전 로더 (시작할 때 조용히 로드한다. 직접 받았을 때만 알린다)
+        {
+            std::lock_guard<std::mutex> lock(enDictLoader.m);
+            if (enDictLoader.done) {
+                enDictLoader.done = false;
+                if (enDictLoader.ok) {
+                    enReady = true;
+                    if (enDictAnnounce) message = "영어 사전 준비 완료: 단어 뜻을 AI 없이 오프라인으로 표시합니다";
+                } else {
+                    message = enDictLoader.status;
+                    enDictLoader.status.clear();
+                }
+            }
+        }
         // AI 모델 목록 / 연결 테스트
         {
             std::lock_guard<std::mutex> lock(llmJob.m);
@@ -1255,7 +1328,7 @@ struct App {
                     wordErr = wordJob.err;
                     wordLoading = false;
                 }
-                if (wordJob.hasPending) startWordJob(wordJob.pendingWord, wordJob.pendingSentence);
+                if (wordJob.hasPending) startWordJob(wordJob.pendingWord, wordJob.pendingSentence, wordJob.pendingAi);
             }
         }
         {
@@ -1484,16 +1557,21 @@ struct App {
             // 일본어: 자막 아래에 한국어 발음을 한 줄 더 (읽지 못하는 한자가 있어도 따라 말할 수 있게)
             std::string pron;
             if (video.lang == Lang::Ja && showPron) pron = readingFor(current).pronunciation;
+            // 한국어 자막은 그 아래 한 줄 더
+            const std::string& ko = koFor(current);
             const float psize = ImGui::GetFontSize() * 1.05f;
             ImVec2 ts = font->CalcTextSizeA(fsize, FLT_MAX, wrap, text.c_str());
             ImVec2 ps = pron.empty() ? ImVec2(0, 0) : font->CalcTextSizeA(psize, FLT_MAX, wrap, pron.c_str());
-            const float gap = pron.empty() ? 0.0f : 4.0f;
-            const float boxW = std::max(ts.x, ps.x), boxH = ts.y + gap + ps.y;
+            ImVec2 ks = ko.empty() ? ImVec2(0, 0) : font->CalcTextSizeA(psize, FLT_MAX, wrap, ko.c_str());
+            const float gap = pron.empty() ? 0.0f : 4.0f, kgap = ko.empty() ? 0.0f : 4.0f;
+            const float boxW = std::max({ts.x, ps.x, ks.x}), boxH = ts.y + gap + ps.y + kgap + ks.y;
             ImVec2 pos(origin.x + (avail.x - boxW) / 2, origin.y + avail.y - boxH - 24);
             dl->AddRectFilled(ImVec2(pos.x - 10, pos.y - 6), ImVec2(pos.x + boxW + 10, pos.y + boxH + 6), IM_COL32(0, 0, 0, 170), 6.0f);
             dl->AddText(font, fsize, ImVec2(pos.x + (boxW - ts.x) / 2, pos.y), IM_COL32(255, 255, 255, 255), text.c_str(), nullptr, wrap);
             if (!pron.empty())
                 dl->AddText(font, psize, ImVec2(pos.x + (boxW - ps.x) / 2, pos.y + ts.y + gap), IM_COL32(255, 230, 140, 255), pron.c_str(), nullptr, wrap);
+            if (!ko.empty())
+                dl->AddText(font, psize, ImVec2(pos.x + (boxW - ks.x) / 2, pos.y + ts.y + gap + ps.y + kgap), IM_COL32(170, 215, 255, 255), ko.c_str(), nullptr, wrap);
         }
         ImGui::EndChild();
     }
@@ -1536,7 +1614,10 @@ struct App {
             const JaReading* rowRead = nullptr;
             if (video.lang == Lang::Ja && showPron && (jaReady || readings.count(i))) { const JaReading& rr = readingFor(i); if (!rr.pronunciation.empty()) rowRead = &rr; }
             ImVec2 pronSize = rowRead ? ImGui::CalcTextSize(rowRead->pronunciation.c_str(), nullptr, false, wrap) : ImVec2(0, 0);
-            float h = ImGui::GetTextLineHeight() + textSize.y + pronSize.y + 6;
+            const bool rowHidden = i == quizSeg && valid(quizSeg) && !quizRevealed;
+            const std::string& rowKo = rowHidden ? std::string() : koFor(i);
+            ImVec2 koSize = rowKo.empty() ? ImVec2(0, 0) : ImGui::CalcTextSize(rowKo.c_str(), nullptr, false, wrap);
+            float h = ImGui::GetTextLineHeight() + textSize.y + pronSize.y + koSize.y + 6;
             bool selected = (i == current);
             if (ImGui::Selectable("##row", selected, 0, ImVec2(0, h))) playSegment(i, loopsSetting);
             if (ImGui::IsItemClicked(ImGuiMouseButton_Right)) toggleBookmark(i);
@@ -1552,6 +1633,8 @@ struct App {
             dl->AddText(font, fs, ImVec2(top.x + 4, top.y + 2 + ImGui::GetTextLineHeight()), col, rowText, nullptr, wrap);
             if (rowRead && !(i == quizSeg && valid(quizSeg) && !quizRevealed))
                 dl->AddText(font, fs, ImVec2(top.x + 4, top.y + 2 + ImGui::GetTextLineHeight() + textSize.y), IM_COL32(255, 230, 140, 200), rowRead->pronunciation.c_str(), nullptr, wrap);
+            if (!rowKo.empty())
+                dl->AddText(font, fs, ImVec2(top.x + 4, top.y + 2 + ImGui::GetTextLineHeight() + textSize.y + pronSize.y), IM_COL32(170, 215, 255, 200), rowKo.c_str(), nullptr, wrap);
             ImGui::PopID();
         }
     }
@@ -1980,20 +2063,50 @@ struct App {
         wordErr.clear();
         wordInfo = WordMeaning();
         wordLoading = false;
-        std::string cached = db.getWordMeaning(wordKey, sentence);
-        if (!cached.empty()) {
-            WordMeaning c = WordMeaning::fromJson(cached);
-            // 사전 결과만 있는데 지금은 AI 를 쓸 수 있으면 다시 찾는다 (영어만. 일본어는 사전이 기본이고 AI 는 버튼으로)
-            if (!c.empty() && !(c.provider == "사전" && llm.ready() && curLang() != Lang::Ja)) { wordInfo = c; return; }
-        }
-        // 일본어: 오프라인 사전이 있으면 AI 없이 바로 채운다 (AI 는 팝업의 버튼으로만)
+        // 순서: 예전에 받아 둔 AI 결과(이미 토큰을 쓴 것) → 오프라인 사전 → 온라인 위키낱말사전.
+        // AI 는 자동으로 부르지 않는다 (팝업의 버튼으로만).
+        WordMeaning cached;
+        if (std::string j = db.getWordMeaning(wordKey, sentence); !j.empty()) cached = WordMeaning::fromJson(j);
+        if (!cached.empty() && cached.provider != "사전") { wordInfo = cached; return; }
         if (curLang() == Lang::Ja && jaReady) {
             wordInfo = dictWord(word, sentence);
             if (!wordInfo.empty() || !wordInfo.reading.empty()) return;
         }
+        if (curLang() == Lang::En && enReady) {
+            wordInfo = enDictWord(word);
+            if (!wordInfo.empty()) return;
+        }
+        if (!cached.empty()) { wordInfo = cached; return; }
         wordLoading = true;
-        if (wordJob.running) { wordJob.hasPending = true; wordJob.pendingWord = wordKey; wordJob.pendingSentence = sentence; return; }
-        startWordJob(wordKey, sentence);
+        if (wordJob.running) { wordJob.hasPending = true; wordJob.pendingAi = false; wordJob.pendingWord = wordKey; wordJob.pendingSentence = sentence; return; }
+        startWordJob(wordKey, sentence, false);
+    }
+
+    // 오프라인 영어 사전으로 단어 정보 만들기 (품사별 한국어 뜻, 없으면 영어 정의)
+    WordMeaning enDictWord(const std::string& word) {
+        WordMeaning w;
+        EnEntry e = enDict.lookup(word);
+        if (e.empty()) return w;
+        w.word = e.word;
+        if (!e.ipa.empty()) w.ipa = "/" + e.ipa + "/";
+        int shown = 0;
+        for (const auto& s : e.senses) {
+            if (shown == 4) break;
+            std::string line = s.pos.empty() ? "" : "[" + s.pos + "] ";
+            if (!s.korean.empty()) {
+                for (size_t i = 0; i < s.korean.size(); ++i) line += (i ? ", " : "") + s.korean[i];
+                if (!s.english.empty()) line += "\n      " + s.english[0];
+            } else {
+                for (size_t i = 0; i < s.english.size() && i < 2; ++i) line += (i ? "\n      " : "") + s.english[i];
+            }
+            if (!w.meaning.empty()) w.meaning += "\n";
+            w.meaning += line;
+            ++shown;
+        }
+        w.contextMeaning = e.formNote;
+        w.provider = "사전";
+        w.model = "위키낱말사전 (오프라인)";
+        return w;
     }
 
     // 오프라인 사전으로 단어 정보 만들기 (문장 속 위치의 형태소를 찾아 기본형 · 읽기 · 품사 · 영어 뜻)
@@ -2034,20 +2147,22 @@ struct App {
         if (!llm.ready() || wordKey.empty()) return;
         wordLoading = true;
         wordErr.clear();
-        if (wordJob.running) { wordJob.hasPending = true; wordJob.pendingWord = wordKey; wordJob.pendingSentence = wordSentence; return; }
-        startWordJob(wordKey, wordSentence);
+        if (wordJob.running) { wordJob.hasPending = true; wordJob.pendingAi = true; wordJob.pendingWord = wordKey; wordJob.pendingSentence = wordSentence; return; }
+        startWordJob(wordKey, wordSentence, true);
     }
 
-    void startWordJob(const std::string& key, const std::string& sentence) {
+    // ai: 팝업의 AI 버튼을 눌렀을 때만 true. 아니면 온라인 위키낱말사전 (오프라인 사전이 없을 때)
+    void startWordJob(const std::string& key, const std::string& sentence, bool ai) {
         if (wordJob.th.joinable()) wordJob.th.join();
         wordJob.running = true; wordJob.done = false; wordJob.hasPending = false;
-        wordJob.word = key; wordJob.sentence = sentence;
+        wordJob.word = key; wordJob.sentence = sentence; wordJob.ai = ai && llm.ready();
         LlmConfig cfg = llm;
         const Lang lang = curLang();
-        wordJob.th = std::thread([this, cfg, key, sentence, lang] {
+        const bool useAi = wordJob.ai;
+        wordJob.th = std::thread([this, cfg, key, sentence, lang, useAi] {
             std::string e;
             WordMeaning r;
-            if (cfg.ready()) {
+            if (useAi) {
                 r = explainWord(cfg, key, sentence, &e, lang);
                 if (r.empty()) {  // AI 실패 → 사전으로 대체 (오류는 함께 보여 준다)
                     std::string e2;
@@ -2089,6 +2204,12 @@ struct App {
             // 직접 읽는 연습을 할 수 있게 읽기 · 발음을 통째로 숨길 수 있다 (단어 아래 발음, 읽기/발음 줄, 자막 아래 발음, 문장 목록)
             if (ImGui::Checkbox("읽기·발음 표시 (P)", &showPron)) db.setSetting("ja.showPron", showPron ? "1" : "0");
             if (ImGui::IsItemHovered()) ImGui::SetTooltip("끄면 한자를 직접 읽는 연습을 할 수 있습니다. 단어를 클릭하면 팝업에서는 읽기와 발음을 볼 수 있습니다.");
+            ImGui::SameLine();
+        }
+        if (!video.ko.empty()) {
+            bool on = showKo;
+            if (ImGui::Checkbox("한국어 자막 (K)", &on)) setShowKo(on);
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip("영상 자막 아래와 문장 목록에 한국어 자막을 보여 줍니다.\n끄면 뜻을 보지 않고 듣고 따라 하는 연습을 할 수 있습니다.");
             ImGui::SameLine();
         }
         ImGui::TextDisabled("단어 클릭: 발음과 뜻  |  드래그: 복사");
@@ -2263,7 +2384,7 @@ struct App {
         ImGui::Separator();
 
         if (wordLoading) {
-            ImGui::TextColored(ImVec4(1, 0.8f, 0.3f, 1), "%s", llm.ready() ? "AI 에게 뜻을 묻는 중..." : "사전에서 찾는 중...");
+            ImGui::TextColored(ImVec4(1, 0.8f, 0.3f, 1), "%s", wordJob.ai ? "AI 에게 뜻을 묻는 중..." : "사전에서 찾는 중...");
         } else {
             if (!w.meaning.empty()) ImGui::TextWrapped("%s", w.meaning.c_str());
             if (!w.contextMeaning.empty()) {
@@ -2282,9 +2403,21 @@ struct App {
                 ImGui::TextColored(ImVec4(1, 0.5f, 0.5f, 1), "%s", wordErr.c_str());
                 ImGui::PopTextWrapPos();
             }
-            if (!llm.ready()) {
+            // 영어: 오프라인 사전이 아직 없으면 받기 권유 (한 번만 받으면 AI 없이 한국어 뜻)
+            if (curLang() == Lang::En && !enReady) {
                 ImGui::Spacing();
-                ImGui::TextDisabled("AI 설정에서 API 키를 넣으면 한국어 뜻과 문맥 설명을 볼 수 있습니다.");
+                bool busy; { std::lock_guard<std::mutex> lock(enDictLoader.m); busy = enDictLoader.busy; }
+                if (busy) ImGui::TextColored(ImVec4(1, 0.8f, 0.3f, 1), "영어 사전 준비 중...");
+                else {
+                    char lbl[96];
+                    if (EnDict::installed()) snprintf(lbl, sizeof lbl, "영어 사전 로드");
+                    else snprintf(lbl, sizeof lbl, "영어 사전 받기 (오프라인, 약 %dMB)", EnDict::packSizeMB());
+                    if (ImGui::SmallButton(lbl)) { enDictAnnounce = true; startEnDictLoad(!EnDict::installed()); }
+                    if (ImGui::IsItemHovered()) ImGui::SetTooltip("위키낱말사전 기반 오프라인 영어 사전을 한 번 받으면\nAI 없이 단어의 한국어 뜻 · 발음 기호 · 품사가 바로 나옵니다.");
+                }
+            } else if (!llm.ready() && w.provider == "사전") {
+                ImGui::Spacing();
+                ImGui::TextDisabled("AI 설정에서 API 키를 넣으면 문맥에 맞는 설명도 볼 수 있습니다 (버튼을 누를 때만 호출).");
             }
         }
 
@@ -2310,7 +2443,7 @@ struct App {
             if (ImGui::SmallButton("AI 설정 열기")) { showSettings = true; ImGui::CloseCurrentPopup(); }
         } else if (!wordLoading && w.provider == "사전") {
             ImGui::SameLine();
-            if (ImGui::SmallButton(curLang() == Lang::Ja ? "AI 로 한국어 설명" : "AI 로 다시 찾기")) requestWordAi();
+            if (ImGui::SmallButton(curLang() == Lang::Ja ? "AI 로 한국어 설명" : "AI 로 문맥 설명")) requestWordAi();
             if (ImGui::IsItemHovered()) ImGui::SetTooltip("AI 를 한 번 호출합니다 (토큰 사용). 결과는 저장되어 같은 단어를 다시 누르면 재사용합니다.");
         }
         if (!w.provider.empty()) {
@@ -2642,6 +2775,7 @@ struct App {
         if (ImGui::IsKeyPressed(ImGuiKey_E, false) && valid(current) && !recording()) startEcho(current);
         if (ImGui::IsKeyPressed(ImGuiKey_T, false) && valid(current) && !recording()) startRecordOnly(current);
         if (ImGui::IsKeyPressed(ImGuiKey_B, false) && valid(current)) toggleBookmark(current);
+        if (ImGui::IsKeyPressed(ImGuiKey_K, false) && !video.ko.empty()) setShowKo(!showKo);
         if (ImGui::IsKeyPressed(ImGuiKey_P, false) && loaded && video.lang == Lang::Ja) { showPron = !showPron; db.setSetting("ja.showPron", showPron ? "1" : "0"); }
     }
 
@@ -2669,6 +2803,7 @@ struct App {
         else if (cmd == "quiz_reveal") quizRevealed = true;
         else if (cmd == "lang") setUiLang(langFromCode(arg));
         else if (cmd == "dict") startDictLoad(!JaDict::installed());  // 일본어 사전 받기/로드
+        else if (cmd == "ko") setShowKo(arg != "0");
         else if (cmd == "pron") { showPron = arg != "0"; db.setSetting("ja.showPron", showPron ? "1" : "0"); }
         else if (cmd == "word" && valid(current)) {  // word <k>: 현재 문장의 k 번째 단어를 클릭한 것처럼
             std::vector<std::string> ws; std::istringstream ws_(seg(current).text); for (std::string w; ws_ >> w;) ws.push_back(w);
@@ -2974,6 +3109,7 @@ int main(int argc, char** argv) {
     for (Lang l : {Lang::En, Lang::Ja})
         if (fs::exists(Stt::modelPath(l))) app.sttLoaderFor(l).start(&app.sttFor(l), false, l);
     if (JaDict::installed()) app.startDictLoad(false);
+    if (EnDict::installed()) app.startEnDictLoad(false);
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
         if (a == "--script" && i + 1 < argc) {
