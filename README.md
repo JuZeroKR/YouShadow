@@ -40,6 +40,8 @@
   - 녹음만: 원본 듣기 없이 바로 녹음 (같은 문장 반복 연습)
   - 무음 감지 자동 종료 (배경 소음을 재서 감도 자동 조절), Space 로 수동 종료
 - **채점**: 내 녹음을 whisper 로 텍스트화해서 원문과 단어 단위로 정렬. 정확도 % 와 맞음 / 빠짐 / 다르게 들림 / 추가로 들림 표시. 추임새("uh", "um")와 효과음 표기는 제외
+  - **억양 · 리듬 · 강세**: 정확도 옆에 세 점수를 더 보여 준다 (AI 없이 PC 안에서 계산). 억양은 원음 화자와 내 녹음의 음높이 곡선을 각자 자기 중앙값 기준 반음으로 바꿔(목소리가 높든 낮든 상관없음) DTW 로 시간을 맞춘 뒤 비교하고, 리듬은 whisper 단어 시각으로 단어별 길이 비율 · 쉼 · 전체 속도를, 강세는 단어별 상대 크기 차이를 본다. 파형 위에 두 음높이 곡선과 단어 눈금이 겹쳐 그려지고(내 파형에는 원음 곡선이 점선으로 함께), 단어 버튼 아래에 "길게 · 세게 · 높게" 처럼 그 단어에서 바꿀 점이 적힌다. 단어를 **우클릭**하면 원음의 그 단어와 내 녹음의 그 단어를 이어서 들려 준다. 단어 시각은 whisper 의 DTW 정렬 시각을 쓰고 소리에 맞춰 다듬으며, 자막 시각이 실제 말과 어긋나는 것을 감안해 원음은 앞뒤 300 ms 를 더 읽고 기준 문장과 맞는 단어만 쓴다
+  - 한 문장을 처음 채점할 때는 원음 구간도 whisper 로 한 번 인식해 단어 시각을 저장하므로 두 배쯤 걸리고, 다음부터는 저장된 값을 쓴다. 배경 음악이 큰 영상은 신뢰도가 떨어지며, 측정할 수 없는 항목은 0 점으로 보이는 대신 숨긴다
 - **문장 학습** ([학습] 탭)
   - 리스닝: 자막을 숨긴 채 문장을 듣고 받아쓰기. 대소문자 · 문장 부호는 무시하고 단어 단위로 채점
   - 영작: AI 해설의 한국어 번역만 보고 영어로 써 보기 (번역이 없으면 그 자리에서 생성)
@@ -205,6 +207,7 @@ src/
   local.cpp       내 영상 파일 등록 (ID, 자막 찾기, 내장 자막 추출, 오디오 추출)
   stt.cpp         whisper.cpp 래퍼 (단어 타임스탬프 / 텍스트)
   scoring.cpp     원문 vs 인식 결과 편집 거리 정렬, 정확도
+  prosody.cpp     억양 · 리듬 · 강세: 음높이(F0) 추출, 반음 정규화, DTW 정렬, 단어별 길이 · 크기 비교
   audio.cpp       miniaudio 녹음/재생, 파형 피크, 리샘플
   db.cpp          SQLite 저장소, 간격 반복, 통계, 설정, 해설 캐시, 표현 카드
   llm.cpp         Claude / OpenAI / Gemini REST 호출, 문장 해설 프롬프트
@@ -214,18 +217,19 @@ src/
   paths.cpp       데이터/모델 경로, 동봉 도구 PATH, 숨김 프로세스 실행
   main.cpp        CLI 버전 (초기 프로토타입)
   stt_test.cpp    STT + 채점 검증 도구
+  prosody_test.cpp  억양 · 리듬 · 강세 분석 검증 도구
 scripts/setup-deps.ps1 · .sh   의존성 설치 (Windows · macOS)
 scripts/package.ps1 · .sh      배포 패키지 (Windows · macOS)
 installer/youshadow.iss  Inno Setup 스크립트
 .github/workflows/release.yml  태그 push 시 자동 빌드 · Release
 ```
 
-테스트용으로 `youshadow-gui.exe --script cmds.txt` 를 주면 `load <id>` / `wait <초>` / `play <n>` / `echo <n>` / `record` / `home` / `review` / `rate hard|good|easy` / `explain` / `explain_all` / `settings` / `tab <name>` / `quit` 명령을 순서대로 실행합니다. 시연 GIF 도 이 방식으로 찍었습니다. `llm_test.exe <claude|openai|gemini> <API키>` 는 문장 해설 한 번을 콘솔에서 시험합니다.
+테스트용으로 `youshadow-gui.exe --script cmds.txt` 를 주면 `load <id>` / `wait <초>` / `play <n>` / `echo <n>` / `record` / `home` / `review` / `rate hard|good|easy` / `explain` / `explain_all` / `settings` / `tab <name>` / `rescore` (현재 문장의 마지막 녹음을 다시 채점) / `prosody_dump` (억양 · 리듬 · 강세 결과를 stderr 로) / `quit` 명령을 순서대로 실행합니다. 시연 GIF 도 이 방식으로 찍었습니다. `llm_test.exe <claude|openai|gemini> <API키>` 는 문장 해설 한 번을 콘솔에서 시험하고, `prosody_test.exe` 는 억양 · 리듬 · 강세 분석을 콘솔에서 시험합니다.
 
 ## 알아 둘 것
 
 - 유튜브가 자막 요청을 일시적으로 막는 경우(HTTP 429)가 있습니다. 그때는 whisper 로 대본을 만들며, 몇 시간 뒤 다시 불러오면 자막을 받습니다.
-- 채점은 CPU 에서 whisper base.en 모델로 돌립니다. 10초 녹음에 약 0.4초 걸립니다.
+- 채점은 CPU 에서 whisper base.en 모델로 돌립니다. 10초 녹음에 약 0.4초 걸립니다. 한 문장을 처음 채점할 때는 억양 · 리듬 비교를 위해 원음 구간도 한 번 인식하므로 두 배쯤 걸리고, 그 결과는 저장되어 다음부터는 빠릅니다.
 - 개인 학습 용도로 만든 프로그램입니다. 영상 다운로드는 유튜브 약관을 확인하고 본인 책임으로 사용하세요.
 
 ## AI 사용 표기
@@ -236,7 +240,7 @@ installer/youshadow.iss  Inno Setup 스크립트
 
 - 문장 편집 (분할 / 병합)
 - 더 큰 whisper 모델 선택 (small.en), GPU 가속
-- 억양 · 속도 비교, 음소 단위 발음 피드백
+- 음소 단위 발음 피드백 (r/l, th 같은 소리 자체)
 
 ## 사전 데이터 출처
 

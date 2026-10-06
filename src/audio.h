@@ -10,6 +10,8 @@ public:
 
     // wav 파일을 메모리에 mono float 로 디코딩한다 (sampleRate 로 리샘플).
     static std::vector<float> loadWav(const std::string& path, int sampleRate = kSampleRate);
+    // wav 의 [startMs, endMs) 구간만 읽는다 (seek, 파일 전체를 읽지 않는다). 긴 영상의 한 문장 원음을 꺼낼 때 쓴다.
+    static std::vector<float> loadWavSlice(const std::string& path, int startMs, int endMs, int sampleRate = kSampleRate);
 
     // 선형 보간 리샘플 (STT 입력용 48k → 16k 등)
     static std::vector<float> resample(const std::vector<float>& pcm, int fromRate, int toRate);

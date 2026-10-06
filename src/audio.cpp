@@ -152,6 +152,26 @@ std::vector<float> AudioEngine::loadWav(const std::string& path, int sampleRate)
     return pcm;
 }
 
+std::vector<float> AudioEngine::loadWavSlice(const std::string& path, int startMs, int endMs, int sampleRate) {
+    ma_decoder_config cfg = ma_decoder_config_init(ma_format_f32, 1, (ma_uint32)sampleRate);
+    ma_decoder dec;
+    if (ma_decoder_init_file(path.c_str(), &cfg, &dec) != MA_SUCCESS) {
+        throw std::runtime_error("오디오 파일을 열 수 없음: " + path);
+    }
+    // seek 의 프레임 번호는 출력 샘플레이트 기준이라 파일이 48 kHz 든 16 kHz 든 같은 식이 된다
+    const ma_uint64 start = (ma_uint64)std::max(0, startMs) * (ma_uint64)sampleRate / 1000;
+    const ma_uint64 want = endMs > startMs ? (ma_uint64)(endMs - startMs) * (ma_uint64)sampleRate / 1000 : 0;
+    std::vector<float> pcm;
+    if (want > 0 && ma_decoder_seek_to_pcm_frame(&dec, start) == MA_SUCCESS) {
+        pcm.resize((size_t)want);
+        ma_uint64 got = 0;
+        ma_decoder_read_pcm_frames(&dec, pcm.data(), want, &got);
+        pcm.resize((size_t)got);
+    }
+    ma_decoder_uninit(&dec);
+    return pcm;
+}
+
 namespace {
 // 프레임을 binFrames 단위로 묶어 [min,max] 를 out 에 누적한다. carry 는 bin 경계를 넘는 상태.
 struct PeakAccum {

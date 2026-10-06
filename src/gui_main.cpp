@@ -18,6 +18,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cctype>
+#include <cfloat>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -41,6 +42,7 @@
 #include "paths.h"
 #include "subtitle.h"
 #include "player.h"
+#include "prosody.h"
 #include "secret.h"
 #include "tts.h"
 #include "scoring.h"
@@ -204,25 +206,52 @@ struct SttLoader {
     ~SttLoader() { if (th.joinable()) th.join(); }
 };
 
-// 녹음 채점 (백그라운드)
+// 녹음 채점 (백그라운드): 단어 정확도 + 억양 · 리듬 · 강세
 struct ScoreJob {
     std::thread th;
     std::mutex m;
     bool running = false, done = false;
     long long practiceId = 0;
+    std::string videoId;              // 채점한 영상 · 문장 (결과를 받을 때 아직 같은 것인지 확인용)
+    int segIdx = -1;
+    int segStartMs = 0, segEndMs = 0;
     ScoreResult result;
     std::string err;
+    // 억양 · 리듬 · 강세
+    prosody::Result prosodyResult;
+    prosody::Track origTrack, userTrack;  // 곡선 표시용 (원음 / 내 녹음)
+    bool haveProsodyTracks = false;       // 두 트랙을 구했다
+    bool origWordsFresh = false;          // 원음 단어 시각을 이번에 새로 인식했다 → DB 에 캐시
+    std::string origWordsJsonOut;
+    // 자막 시각은 실제 말소리와 수백 ms 어긋나기도 하고 앞뒤 대사의 꼬리가 섞이기도 한다. 그래서 원음은 앞뒤로 kOrigPadMs 넓게 읽어
+    // whisper 가 이웃 단어까지 인식하게 한 뒤, 기준 문장과 맞는 단어만 쓴다. 원음 트랙 · 단어 시각은 이 넓힌 클립 기준이다
+    static constexpr int kOrigPadMs = 300;
+    int origPadMs = 0;                    // 실제로 앞에 붙은 여유 (영상 맨 앞이면 300 보다 작다)
 
     // dict: 일본어면 원문과 인식 결과를 모두 읽기(히라가나)로 바꿔 비교한다 (한자/가나 표기 차이를 없앤다)
-    void start(Stt* stt, long long pid, std::string reference, std::vector<float> pcm48k, Lang lang = Lang::En, const JaDict* dict = nullptr) {
+    // origAudioPath 가 비어 있으면 억양 비교를 건너뛴다. origWordsJson 은 DB 에 캐시된 원음 단어 시각 (비어 있으면 원음도 이번에 인식한다)
+    void start(Stt* stt, long long pid, std::string reference, std::vector<float> pcm48k, Lang lang, const JaDict* dict,
+               std::string origAudioPath, int segStart, int segEnd, std::string origWordsJson,
+               std::string vid, int seg) {
         if (th.joinable()) th.join();
-        { std::lock_guard<std::mutex> lock(m); running = true; done = false; practiceId = pid; err.clear(); }
-        th = std::thread([this, stt, reference, lang, dict, pcm = std::move(pcm48k)] {
+        {
+            std::lock_guard<std::mutex> lock(m);
+            running = true; done = false; practiceId = pid; err.clear();
+            videoId = std::move(vid); segIdx = seg; segStartMs = segStart; segEndMs = segEnd;
+        }
+        th = std::thread([this, stt, reference, lang, dict, origAudioPath, segStart, segEnd, origWordsJson, pcm = std::move(pcm48k)] {
             ScoreResult r;
+            prosody::Result pr;
+            prosody::Track oTrack, uTrack;
+            bool haveTracks = false, fresh = false;
+            std::string origJson;
             std::string e;
             try {
                 auto pcm16 = AudioEngine::resample(pcm, AudioEngine::kSampleRate, Stt::kRate);
-                std::string heard = stt->transcribeText(pcm16, &e);
+                std::vector<Word> userWords = stt->transcribe(pcm16, {}, &e);
+                // transcribeText 와 같은 방식으로 단어를 이어 붙인다
+                std::string heard;
+                for (const auto& w : userWords) { if (!heard.empty()) heard += ' '; heard += w.text; }
                 if (e.empty()) {
                     if (lang == Lang::Ja && dict && dict->loaded()) {
                         r = scoreTranscript(dict->toReading(reference, true), dict->toReading(heard, true), lang);
@@ -231,11 +260,56 @@ struct ScoreJob {
                         r = scoreTranscript(reference, heard, lang);
                     }
                 }
+                if (e.empty() && !origAudioPath.empty()) {
+                    std::vector<float> origPcm;
+                    // 일본어는 whisper 가 단어를 나누지 못해 이웃 대사를 걸러 낼 수 없으므로 자막 구간 그대로 읽는다
+                    const int pad = lang == Lang::Ja ? 0 : kOrigPadMs;
+                    const int padFront = std::min(pad, segStart);
+                    try {
+                        origPcm = AudioEngine::loadWavSlice(origAudioPath, segStart - padFront, segEnd + pad, Stt::kRate);
+                    } catch (const std::exception&) {
+                        origPcm.clear();
+                    }
+                    if (origPcm.empty()) {
+                        pr.note = "원음 구간을 읽지 못해 억양 비교 생략";
+                    } else {
+                        std::vector<Word> origWords;
+                        if (!origWordsJson.empty()) origWords = prosody::wordsFromJson(origWordsJson);
+                        if (origWords.empty()) {
+                            // 캐시가 없으면 원음을 한 번 인식한다 (문장당 한 번, 결과는 DB 에 저장). 빈 결과는 저장하지 않는다
+                            std::string e2;
+                            origWords = stt->transcribe(origPcm, {}, &e2);
+                            fresh = e2.empty() && !origWords.empty();
+                            if (fresh) origJson = prosody::wordsToJson(origWords);
+                        }
+                        // 넓힌 구간에 들어온 이웃 대사의 단어는 빼고, 기준 문장과 맞는 단어만으로 말소리 구간을 잡는다
+                        std::vector<Word> matched;
+                        if (lang != Lang::Ja) {
+                            std::vector<std::string> texts;
+                            for (const auto& w : origWords) texts.push_back(w.text);
+                            std::vector<char> used(origWords.size(), 0);
+                            for (int j : alignTokens(reference, texts, lang)) if (j >= 0) used[j] = 1;
+                            for (size_t i = 0; i < origWords.size(); ++i) if (used[i]) matched.push_back(origWords[i]);
+                        }
+                        oTrack = prosody::analyze(origPcm, matched.size() >= 2 ? matched : origWords);
+                        uTrack = prosody::analyze(pcm16, userWords);
+                        haveTracks = true;
+                        // 단어를 많이 틀려도 억양 · 속도 · 강세는 소리로 비교한다 (맞은 단어가 적으면 리듬은 속도만, 강세는 DTW 로)
+                        pr = prosody::compare(oTrack, origWords, uTrack, userWords, reference, lang);
+                    }
+                }
             } catch (const std::exception& ex) {
                 e = ex.what();
             }
             std::lock_guard<std::mutex> lock(m);
             result = std::move(r);
+            prosodyResult = std::move(pr);
+            origTrack = std::move(oTrack);
+            userTrack = std::move(uTrack);
+            haveProsodyTracks = haveTracks;
+            origWordsFresh = fresh;
+            origWordsJsonOut = std::move(origJson);
+            origPadMs = std::min(lang == Lang::Ja ? 0 : kOrigPadMs, segStart);
             err = e;
             done = true;
         });
@@ -267,6 +341,10 @@ struct App {
     MpvPlayer mpv;
     Recorder recorder;
     Player recPlayer;
+    // 단어 비교 듣기: 원음의 그 단어 → 잠깐 쉼 → 내 녹음의 그 단어 (큐에 넣고 update 에서 차례로 재생)
+    Player wordPlayer;
+    struct WordClip { std::vector<float> pcm48k; float gain; };
+    std::vector<WordClip> wordQueue;
     Db db;
     Stt sttEn, sttJa;              // 언어별 whisper (영어 base.en / 일본어 small)
     Loader loader;
@@ -403,6 +481,9 @@ struct App {
     bool scoring = false;
     int scoreSeg = -1;
     ScoreResult lastScore;
+    // 억양 · 리듬 · 강세 (채점 결과와 함께 들어온다). have 가 true 면 곡선(orig / user) 을 그릴 수 있다
+    struct ProsodyView { prosody::Result result; prosody::Track orig, user; bool have = false; int origPadMs = 0; } lastProsody;
+    std::string scoreRecPath;   // 채점한 녹음 파일. 기록 탭에서 다른 녹음을 들을 땐 그 파형에 곡선을 겹치지 않는다
 
     // 홈(라이브러리) 화면
     bool showHome = true;
@@ -517,6 +598,7 @@ struct App {
     std::vector<int> readingPending;         // 작업 중에 들어온 요청
     bool showPron = true;                    // 자막 아래 한국어 발음 표시
     bool showKo = true;                      // 한국어 자막 표시 (내 영상 파일에 한국어 자막이 있을 때)
+    bool alignWave = true;                   // 내 녹음 파형 · 곡선을 원음 시간축에 맞춰 그린다 (늦게 시작하거나 느리게 말해도 나란히)
 
     // 문장 i 의 한국어 자막 (끄거나 없으면 빈 문자열)
     const std::string& koFor(int i) const {
@@ -799,6 +881,7 @@ struct App {
         uiLang = langFromCode(db.getSetting("ui.lang", "en"));
         showPron = db.getSetting("ja.showPron", "1") == "1";
         showKo = db.getSetting("sub.showKo", "1") == "1";
+        alignWave = db.getSetting("wave.align", "1") == "1";
         snprintf(keyBuf[0], sizeof keyBuf[0], "%s", llm.claudeKey.c_str());
         snprintf(keyBuf[1], sizeof keyBuf[1], "%s", llm.openaiKey.c_str());
         snprintf(keyBuf[2], sizeof keyBuf[2], "%s", llm.geminiKey.c_str());
@@ -932,6 +1015,8 @@ struct App {
     }
 
     void stopAll() {
+        wordQueue.clear();
+        wordPlayer.stop();
         if (recorder.active()) recorder.stop();
         recPlayer.stop();
         mpv.setPaused(true);
@@ -972,6 +1057,14 @@ struct App {
         return false;
     }
 
+    // 현재 문장 · myRec 으로 채점 작업 시작 (단어 정확도 + 억양 · 리듬 · 강세). 원음 단어 시각 캐시가 있으면 함께 넘긴다
+    void startScoreJob(long long pid) {
+        const auto& s = seg(current);
+        scoreRecPath = myRecPath;
+        scoreJob.start(&sttCur(), pid, s.text, myRec, video.lang, jaReady ? &jaDict : nullptr,
+                       video.audioPath, s.startMs, s.endMs, db.getSegWords(video.id, current), video.id, current);
+    }
+
     // 녹음 종료 → 저장, 기록, 채점 시작
     long long finishRecording(const char* modeName) {
         auto rec = recorder.stop();
@@ -979,10 +1072,11 @@ struct App {
         setMyRec(std::move(rec), path);
         long long pid = log(current, modeName, path);
         haveScore = false;
+        lastProsody = ProsodyView{};
         scoreSeg = current;
         if (sttCur().loaded()) {
             scoring = true;
-            scoreJob.start(&sttCur(), pid, seg(current).text, myRec, video.lang, jaReady ? &jaDict : nullptr);
+            startScoreJob(pid);
         }
         return pid;
     }
@@ -1137,6 +1231,11 @@ struct App {
     // ---- 매 프레임 상태 갱신 ----
     void update() {
         pollJobs();
+        if (!wordQueue.empty() && !wordPlayer.playing()) {
+            wordPlayer.setGain(wordQueue.front().gain);
+            wordPlayer.play(std::move(wordQueue.front().pcm48k));
+            wordQueue.erase(wordQueue.begin());
+        }
         if (!loaded) return;
         const double t = mpv.timePos();
 
@@ -1338,10 +1437,27 @@ struct App {
                 scoreJob.running = false;
                 scoring = false;
                 if (scoreJob.err.empty()) {
-                    lastScore = scoreJob.result;
-                    haveScore = true;
-                    if (scoreJob.practiceId > 0) db.setPracticeScore(scoreJob.practiceId, lastScore.accuracy);
-                    bestScores = db.bestScoresFor(video.id);
+                    const prosody::Result& p = scoreJob.prosodyResult;
+                    if (scoreJob.practiceId > 0) {
+                        db.setPracticeScore(scoreJob.practiceId, scoreJob.result.accuracy);
+                        db.setPracticeProsody(scoreJob.practiceId, p.haveIntonation ? p.intonation : -1,
+                                              p.haveRhythm ? p.rhythm : -1, p.haveStress ? p.stress : -1);
+                        historyDirty = true;
+                    }
+                    // 원음 단어 시각을 새로 인식했으면 캐시한다 (그 사이 다른 영상을 열었으면 버린다)
+                    const bool sameVideo = loaded && scoreJob.videoId == video.id;
+                    if (scoreJob.origWordsFresh && sameVideo && valid(scoreJob.segIdx)) db.setSegWords(video.id, scoreJob.segIdx, scoreJob.origWordsJsonOut);
+                    // 화면에는 지금 보고 있는 영상 · 문장의 결과일 때만 반영한다
+                    if (sameVideo && scoreJob.segIdx == scoreSeg) {
+                        lastScore = scoreJob.result;
+                        haveScore = true;
+                        lastProsody.result = std::move(scoreJob.prosodyResult);
+                        lastProsody.orig = std::move(scoreJob.origTrack);
+                        lastProsody.user = std::move(scoreJob.userTrack);
+                        lastProsody.have = scoreJob.haveProsodyTracks;
+                        lastProsody.origPadMs = scoreJob.origPadMs;
+                    }
+                    if (loaded) bestScores = db.bestScoresFor(video.id);
                 } else {
                     message = "채점 실패: " + scoreJob.err;
                 }
@@ -1357,7 +1473,10 @@ struct App {
         myRec.clear();
         myRecPeaks.clear();
         haveScore = false;
+        scoring = false;   // 이전 영상의 채점이 진행 중이어도 새 영상에서는 "채점 중" 을 보이지 않는다 (결과는 pollJobs 가 버린다)
         scoreSeg = -1;
+        lastProsody = ProsodyView{};
+        scoreRecPath.clear();
         int durMs = (int)(video.peaks.size() / 2) * kPeakBinMs;
         db.upsertVideo(video.id, video.title, durMs, video.lang);
         readings.clear();
@@ -1505,6 +1624,85 @@ struct App {
             dl->AddLine(ImVec2(x, p.y), ImVec2(x, p.y + size.y), IM_COL32(255, 80, 80, 255), 2.0f);
         }
         ImGui::Dummy(size);
+    }
+
+    // ---- 음높이 곡선 (파형 위에 겹쳐 그림) ----
+    // 프레임 k 의 중심 시각 (ms). 16 kHz 에서 프레임 k 는 샘플 [160k, 160k+587) 이므로 중심 ≈ (160k + 293) / 16 = k*10 + 18 ms
+    static float frameCenterMs(int k) { return k * (float)prosody::kHopMs + 18.0f; }
+
+    // 반음 곡선을 사각형(pos, size) 안에 그린다. 세로는 두 파형 공통으로 ±12 반음, NaN(무성음) 에서 선을 끊는다.
+    // durationMs: 이 사각형이 나타내는 클립 길이. ghost 는 원음 곡선을 내 녹음 시간축으로 옮긴 것 (점선, 내 곡선 아래에)
+    // offsetMs: 곡선의 클립이 사각형의 0 ms 보다 이만큼 앞에서 시작한다 (원음은 앞에 여유를 붙여 읽는다)
+    // scale · shiftMs: 곡선 시각을 (t − offsetMs) * scale + shiftMs 로 옮겨 다른 클립의 시간축에 맞출 때 쓴다
+    void drawPitchCurve(ImVec2 pos, ImVec2 size, const std::vector<float>& st, const std::vector<float>* ghost, float durationMs, ImU32 color,
+                        float offsetMs = 0.0f, float scale = 1.0f, float shiftMs = 0.0f) {
+        if (durationMs <= 0 || size.x <= 0 || size.y <= 0) return;
+        ImDrawList* dl = ImGui::GetWindowDrawList();
+        dl->PushClipRect(pos, ImVec2(pos.x + size.x, pos.y + size.y), true);
+        const float midY = pos.y + size.y / 2;
+        const float yScale = (size.y / 2 - 2) / 12.0f;
+        auto xOf = [&](int k) { return pos.x + ((frameCenterMs(k) - offsetMs) * scale + shiftMs) / durationMs * size.x; };
+        auto yOf = [&](float v) { return midY - std::clamp(v, -12.0f, 12.0f) * yScale; };
+        if (ghost) {
+            // 점선: 6 px 칸을 하나 걸러 그린다
+            const float dash = 6.0f * uiScale;
+            const ImU32 gcol = IM_COL32(90, 170, 255, 160);
+            for (int k = 0; k + 1 < (int)ghost->size(); ++k) {
+                const float a = (*ghost)[k], b = (*ghost)[k + 1];
+                if (std::isnan(a) || std::isnan(b)) continue;
+                const float x0 = xOf(k);
+                if (((int)((x0 - pos.x) / dash)) % 2) continue;
+                dl->AddLine(ImVec2(x0, yOf(a)), ImVec2(xOf(k + 1), yOf(b)), gcol, 1.5f * uiScale);
+            }
+        }
+        std::vector<ImVec2> pts;
+        pts.reserve(st.size());
+        const float thick = 2.0f * uiScale;
+        auto flush = [&] {
+            if (pts.size() >= 2) dl->AddPolyline(pts.data(), (int)pts.size(), color, thick);
+            else if (pts.size() == 1) dl->AddCircleFilled(pts[0], thick * 0.75f, color);  // 유성음 한 프레임짜리도 보이게
+            pts.clear();
+        };
+        for (int k = 0; k < (int)st.size(); ++k) {
+            if (std::isnan(st[k])) { flush(); continue; }
+            pts.push_back(ImVec2(xOf(k), yOf(st[k])));
+        }
+        flush();
+        dl->PopClipRect();
+    }
+
+    // 단어 눈금: 기준 문장의 단어가 시작하는 곳에 세로선, 칸이 넓으면 단어도 적는다. user 면 내 녹음 시간축
+    void drawWordTicks(ImVec2 pos, ImVec2 size, float durationMs, bool user, float offsetMs = 0.0f, float scale = 1.0f, float shiftMs = 0.0f) {
+        if (durationMs <= 0 || size.x <= 0) return;
+        ImDrawList* dl = ImGui::GetWindowDrawList();
+        dl->PushClipRect(pos, ImVec2(pos.x + size.x, pos.y + size.y), true);
+        ImFont* font = ImGui::GetFont();
+        const float fs = 12.0f * uiScale;
+        for (const auto& wp : lastProsody.result.words) {
+            const float s = user ? (wp.userStartMs - offsetMs) * scale + shiftMs : (float)(wp.origStartMs - lastProsody.origPadMs);
+            const float e = user ? (wp.userEndMs - offsetMs) * scale + shiftMs : (float)(wp.origEndMs - lastProsody.origPadMs);
+            const float x0 = pos.x + s / durationMs * size.x, x1 = pos.x + e / durationMs * size.x;
+            dl->AddLine(ImVec2(x0, pos.y), ImVec2(x0, pos.y + size.y), IM_COL32(255, 255, 255, 50), 1.0f);
+            const float tw = font->CalcTextSizeA(fs, FLT_MAX, 0.0f, wp.text.c_str()).x;
+            if (x1 - x0 > tw + 4) dl->AddText(font, fs, ImVec2(x0 + 2, pos.y + 2), IM_COL32(255, 255, 255, 150), wp.text.c_str());
+        }
+        dl->PopClipRect();
+    }
+
+    // 내 녹음 파형 위에 마우스를 올리면 가장 가까운 단어의 차이를 보여 준다 (바로 앞 항목이 그 파형이어야 한다)
+    void drawWordPairTooltip(ImVec2 pos, ImVec2 size, float durationMs, float offsetMs = 0.0f, float scale = 1.0f, float shiftMs = 0.0f) {
+        if (durationMs <= 0 || size.x <= 0 || lastProsody.result.words.empty() || !ImGui::IsItemHovered()) return;
+        // 마우스 위치의 시각 (사각형 축) → 내 녹음 시각
+        const float tMs = ((ImGui::GetMousePos().x - pos.x) / size.x * durationMs - shiftMs) / scale + offsetMs;
+        const prosody::WordPair* best = nullptr;
+        float bestD = FLT_MAX;
+        for (const auto& wp : lastProsody.result.words) {
+            const float d = tMs < wp.userStartMs ? wp.userStartMs - tMs : tMs > wp.userEndMs ? tMs - wp.userEndMs : 0.0f;
+            if (d < bestD) { bestD = d; best = &wp; }
+        }
+        if (!best) return;
+        if (best->hasPitch) ImGui::SetTooltip("'%s'  길이 ×%.1f  크기 %+.2f  음높이 %+.1f 반음", best->text.c_str(), best->durRatio, best->loudDiff, best->pitchDiffSt);
+        else ImGui::SetTooltip("'%s'  길이 ×%.1f  크기 %+.2f", best->text.c_str(), best->durRatio, best->loudDiff);
     }
 
     void drawVideoPanel(ImVec2 size) {
@@ -1679,10 +1877,20 @@ struct App {
         ImGui::TextDisabled("[%d] %s", current, seg(current).text.c_str());
         ImGui::Separator();
         if (history.empty()) { ImGui::TextDisabled("아직 연습 기록이 없습니다."); return; }
-        if (ImGui::BeginTable("hist", 4, ImGuiTableFlags_RowBg | ImGuiTableFlags_SizingStretchProp)) {
+        // 점수 칸: 없으면 "-", 있으면 85 / 60 기준 색
+        auto scoreCell = [](double v, bool percent) {
+            if (v < 0) { ImGui::TextDisabled("-"); return; }
+            ImVec4 col = v >= 85 ? ImVec4(0.4f, 1, 0.5f, 1) : v >= 60 ? ImVec4(1, 0.85f, 0.3f, 1) : ImVec4(1, 0.5f, 0.5f, 1);
+            if (percent) ImGui::TextColored(col, "%d%%", (int)std::lround(v));
+            else ImGui::TextColored(col, "%d", (int)std::lround(v));
+        };
+        if (ImGui::BeginTable("hist", 7, ImGuiTableFlags_RowBg | ImGuiTableFlags_SizingStretchProp)) {
             ImGui::TableSetupColumn("시각", ImGuiTableColumnFlags_WidthStretch, 3.0f);
             ImGui::TableSetupColumn("모드", ImGuiTableColumnFlags_WidthStretch, 1.4f);
-            ImGui::TableSetupColumn("점수", ImGuiTableColumnFlags_WidthStretch, 1.0f);
+            ImGui::TableSetupColumn("정확도", ImGuiTableColumnFlags_WidthStretch, 1.0f);
+            ImGui::TableSetupColumn("억양", ImGuiTableColumnFlags_WidthStretch, 0.8f);
+            ImGui::TableSetupColumn("리듬", ImGuiTableColumnFlags_WidthStretch, 0.8f);
+            ImGui::TableSetupColumn("강세", ImGuiTableColumnFlags_WidthStretch, 0.8f);
             ImGui::TableSetupColumn("", ImGuiTableColumnFlags_WidthStretch, 1.2f);
             ImGui::TableHeadersRow();
             for (size_t k = 0; k < history.size(); ++k) {
@@ -1696,10 +1904,13 @@ struct App {
                                      : h.mode == "repeat" ? "반복" : h.mode == "listen" ? "리스닝" : h.mode == "compose" ? "영작" : "재생";
                 ImGui::TextUnformatted(modeName);
                 ImGui::TableNextColumn();
-                if (h.score >= 0) {
-                    ImVec4 col = h.score >= 85 ? ImVec4(0.4f, 1, 0.5f, 1) : h.score >= 60 ? ImVec4(1, 0.85f, 0.3f, 1) : ImVec4(1, 0.5f, 0.5f, 1);
-                    ImGui::TextColored(col, "%d%%", (int)h.score);
-                } else ImGui::TextDisabled("-");
+                scoreCell(h.score, true);
+                ImGui::TableNextColumn();
+                scoreCell(h.intonation, false);
+                ImGui::TableNextColumn();
+                scoreCell(h.rhythm, false);
+                ImGui::TableNextColumn();
+                scoreCell(h.stress, false);
                 ImGui::TableNextColumn();
                 if (!h.recordingPath.empty() && fs::exists(h.recordingPath)) {
                     if (ImGui::SmallButton("듣기")) {
@@ -2218,6 +2429,9 @@ struct App {
         const bool ja = video.lang == Lang::Ja;
         std::vector<std::string> words, labels;
         const JaReading* rd = nullptr;
+        // 채점 뒤에는 단어마다 원음과의 차이를 아래 줄에 적는다 ("길게 세게" 처럼). pairOf[k] = 그 단어의 WordPair (없으면 nullptr)
+        std::vector<const prosody::WordPair*> pairOf;
+        bool anyMark = false;
         if (ja) {
             rd = &readingFor(current);
             for (const auto& t : rd->tokens) {
@@ -2228,7 +2442,28 @@ struct App {
             std::istringstream ss(sentence);
             std::string w;
             while (ss >> w) { words.push_back(w); labels.push_back(w); }
+            const bool showPairs = haveScore && scoreSeg == current && !scoring && lastProsody.have && !lastProsody.result.words.empty();
+            pairOf.assign(words.size(), nullptr);
+            if (showPairs) {
+                // 띄어쓰기 단어 → 채점 토큰 번호 (채점은 추임새 · 괄호를 뺀다). 표기가 같은 것을 차례로 맞춘다
+                const auto toks = scoringTokens(sentence, video.lang);
+                size_t j = 0;
+                std::vector<int> tokIdx(words.size(), -1);
+                for (size_t k = 0; k < words.size(); ++k)
+                    if (j < toks.size() && toks[j] == words[k]) tokIdx[k] = (int)j++;
+                for (size_t k = 0; k < words.size(); ++k) {
+                    if (tokIdx[k] < 0) continue;
+                    for (const auto& wp : lastProsody.result.words) if (wp.refIdx == tokIdx[k]) { pairOf[k] = &wp; break; }
+                }
+                for (size_t k = 0; k < words.size(); ++k) {
+                    std::string mark = wordMark(pairOf[k]);
+                    if (!mark.empty()) anyMark = true;
+                    labels[k] = words[k] + "\n" + (mark.empty() ? "·" : mark);
+                }
+                if (!anyMark) for (size_t k = 0; k < words.size(); ++k) labels[k] = words[k];
+            }
         }
+        const bool twoLine = ja || anyMark;
         std::vector<std::pair<ImVec2, ImVec2>> rects(words.size());
 
         // 드래그 판정: 누른 뒤 조금 움직이면 드래그 (버튼 클릭은 무시)
@@ -2245,8 +2480,16 @@ struct App {
             ImGui::PushID((int)k);
             float bw = ImGui::CalcTextSize(labels[k].c_str()).x + ImGui::GetStyle().FramePadding.x * 2;
             if (ImGui::GetItemRectMax().x + spacing + bw <= lineRight) ImGui::SameLine();
-            bool pressed = ja ? ImGui::Button((labels[k] + "##tok").c_str()) : ImGui::SmallButton(words[k].c_str());
+            bool pressed = twoLine ? ImGui::Button((labels[k] + "##tok").c_str()) : ImGui::SmallButton(words[k].c_str());
             rects[k] = {ImGui::GetItemRectMin(), ImGui::GetItemRectMax()};
+            if (!ja && k < pairOf.size() && pairOf[k]) {
+                const auto& wp = *pairOf[k];
+                if (ImGui::IsItemHovered()) {
+                    if (wp.hasPitch) ImGui::SetTooltip("'%s'  길이 ×%.1f  크기 %+.2f  음높이 %+.1f 반음\n우클릭: 원음 → 내 소리 이어 듣기", wp.text.c_str(), wp.durRatio, wp.loudDiff, wp.pitchDiffSt);
+                    else ImGui::SetTooltip("'%s'  길이 ×%.1f  크기 %+.2f\n우클릭: 원음 → 내 소리 이어 듣기", wp.text.c_str(), wp.durRatio, wp.loudDiff);
+                }
+                if (ImGui::IsItemClicked(ImGuiMouseButton_Right)) playWordPair(wp);
+            }
             if (ImGui::IsItemClicked(ImGuiMouseButton_Left)) {
                 wordDrag.anchor = (int)k;
                 wordDrag.dragging = false;
@@ -2341,6 +2584,37 @@ struct App {
             drawWordPopup();
             ImGui::EndPopup();
         }
+    }
+
+    // 단어 아래 줄에 적는 차이: 길이 · 세기 · 높낮이 중 문턱을 넘은 것 (없으면 빈 문자열)
+    static std::string wordMark(const prosody::WordPair* wp) {
+        if (!wp) return "";
+        std::string m;
+        auto add = [&](const char* s) { if (!m.empty()) m += " "; m += s; };
+        const bool longEnough = wp->origEndMs - wp->origStartMs >= 80 && wp->userEndMs - wp->userStartMs >= 80;
+        const float ld = std::log2(std::max(wp->durRatio, 1e-3f));
+        if (longEnough && std::fabs(ld) > 0.5f) add(ld < 0 ? "길게" : "짧게");
+        if (std::fabs(wp->loudDiff) > 0.2f) add(wp->loudDiff > 0 ? "약하게" : "세게");
+        if (wp->hasPitch && std::fabs(wp->pitchDiffSt) > 3.f) add(wp->pitchDiffSt > 0 ? "낮게" : "높게");
+        return m;
+    }
+
+    // 원음의 그 단어와 내 녹음의 그 단어를 이어서 들려 준다 (앞뒤 40 ms 여유, 사이 250 ms 쉼)
+    void playWordPair(const prosody::WordPair& wp) {
+        if (!loaded || !valid(current) || myRec.empty()) return;
+        if (!mpv.paused()) togglePause();
+        wordPlayer.stop();
+        wordQueue.clear();
+        const auto& s = seg(current);
+        try {
+            const int base = s.startMs - lastProsody.origPadMs;  // 원음 단어 시각은 앞에 여유를 붙인 클립 기준
+            auto orig = AudioEngine::loadWavSlice(video.audioPath, base + wp.origStartMs - 40, base + wp.origEndMs + 40, AudioEngine::kSampleRate);
+            orig.resize(orig.size() + (size_t)AudioEngine::kSampleRate / 4, 0.0f);  // 250 ms 쉼
+            if (!orig.empty()) wordQueue.push_back({std::move(orig), videoVolume / 100.0f});
+        } catch (const std::exception&) {}
+        const size_t a = (size_t)std::max(0, wp.userStartMs - 40) * AudioEngine::kSampleRate / 1000;
+        const size_t b = std::min(myRec.size(), (size_t)(wp.userEndMs + 40) * AudioEngine::kSampleRate / 1000);
+        if (b > a) wordQueue.push_back({std::vector<float>(myRec.begin() + a, myRec.begin() + b), recVolume / 100.0f});
     }
 
     // 단어 클릭 처리 (스크립트에서도 사용)
@@ -2461,14 +2735,35 @@ struct App {
             return;
         }
         const auto& r = lastScore;
-        drawScoreMarks(r);
+        drawScoreMarks(r, &lastProsody);
         ImGui::TextDisabled("초록: 맞음  빨강: 빠짐  주황: 다르게 들림(들린 단어)  회색: 추가로 들린 단어  |  들린 문장: %s", r.heard.c_str());
     }
 
-    // 정확도 + 단어별 채점 표시 (발음 채점과 문장 학습에서 공용)
-    void drawScoreMarks(const ScoreResult& r) {
-        ImVec4 col = r.accuracy >= 85 ? ImVec4(0.4f, 1, 0.5f, 1) : r.accuracy >= 60 ? ImVec4(1, 0.85f, 0.3f, 1) : ImVec4(1, 0.5f, 0.5f, 1);
-        ImGui::TextColored(col, "정확도 %d%% (%d/%d)", (int)r.accuracy, r.matched, r.total);
+    // 정확도 + 단어별 채점 표시 (발음 채점과 문장 학습에서 공용). pv 가 있으면 억양 · 리듬 · 강세 점수와 힌트도 같이 보인다
+    void drawScoreMarks(const ScoreResult& r, const ProsodyView* pv = nullptr) {
+        auto band = [](float v) { return v >= 85 ? ImVec4(0.4f, 1, 0.5f, 1) : v >= 60 ? ImVec4(1, 0.85f, 0.3f, 1) : ImVec4(1, 0.5f, 0.5f, 1); };
+        ImGui::TextColored(band(r.accuracy), "정확도 %d%% (%d/%d)", (int)r.accuracy, r.matched, r.total);
+        if (pv) {
+            // 측정한 항목만 같은 줄에 덧붙인다. 측정 못 한 항목은 0 으로 보이지 않고 숨긴다
+            const auto& p = pv->result;
+            if (p.haveIntonation) {
+                ImGui::SameLine(0, 14);
+                ImGui::TextColored(band(p.intonation), "억양 %d", (int)std::lround(p.intonation));
+                if (ImGui::IsItemHovered()) ImGui::SetTooltip("억양: 원음 화자와 음높이 곡선 차이, 반음 평균 %.1f — 목소리 높낮이 차이는 빼고 비교", p.pitchDiffSt);
+            }
+            if (p.haveRhythm) {
+                ImGui::SameLine(0, 14);
+                if (p.rhythmSpeedOnly) ImGui::TextColored(band(p.rhythm), "리듬 %d (속도만)", (int)std::lround(p.rhythm));
+                else ImGui::TextColored(band(p.rhythm), "리듬 %d", (int)std::lround(p.rhythm));
+                if (ImGui::IsItemHovered()) ImGui::SetTooltip("리듬: 단어별 길이 비율과 쉼, 속도 %.2f배", p.speedRatio);
+            }
+            if (p.haveStress) {
+                ImGui::SameLine(0, 14);
+                ImGui::TextColored(band(p.stress), "강세 %d", (int)std::lround(p.stress));
+                if (ImGui::IsItemHovered()) ImGui::SetTooltip("강세: 단어별 소리 크기 차이");
+            }
+            if (!p.note.empty()) { ImGui::SameLine(0, 14); ImGui::TextDisabled("(%s)", p.note.c_str()); }
+        }
         // 단어를 색으로 표시하되 패널 폭에 맞춰 직접 줄바꿈한다
         const float lineRight = ImGui::GetWindowPos().x + ImGui::GetWindowSize().x - ImGui::GetStyle().WindowPadding.x;
         const float spacing = ImGui::GetStyle().ItemSpacing.x;
@@ -2484,6 +2779,13 @@ struct App {
             float w = ImGui::CalcTextSize(label.c_str()).x;
             if (ImGui::GetItemRectMax().x + spacing + w <= lineRight) ImGui::SameLine();
             ImGui::TextColored(c, "%s", label.c_str());
+        }
+        if (pv && !pv->result.hints.empty()) {
+            std::string s = "힌트: ";
+            for (size_t i = 0; i < pv->result.hints.size(); ++i) { if (i) s += " · "; s += pv->result.hints[i].text; }
+            ImGui::PushStyleColor(ImGuiCol_Text, ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled));
+            ImGui::TextWrapped("%s", s.c_str());
+            ImGui::PopStyleColor();
         }
     }
 
@@ -2700,6 +3002,9 @@ struct App {
         } else {
             ImGui::Checkbox("무음 감지 자동 종료", &autoStop);
             ImGui::SameLine();
+            if (ImGui::Checkbox("파형 맞추기", &alignWave)) db.setSetting("wave.align", alignWave ? "1" : "0");
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip("채점 뒤 내 녹음 파형과 음높이 곡선을 원음의 시간축에 맞춰 보여 줍니다.\n늦게 시작하거나 느리게 말해도 같은 단어가 위아래로 나란히 놓여 비교하기 쉽습니다.");
+            ImGui::SameLine();
             ImGui::SetNextItemWidth(120 * uiScale);
             ImGui::SliderFloat("##silence", &silenceSec, 0.5f, 3.0f, "%.1f초 무음");
             ImGui::SameLine();
@@ -2742,21 +3047,70 @@ struct App {
         ImGui::EndDisabled();
         ImGui::EndDisabled();
 
-        // 5행: 파형 (원본 문장 / 내 녹음)
+        // 6행: 파형 (원본 문장 / 내 녹음). 채점이 끝나면 그 위에 음높이 곡선과 단어 눈금을 겹친다
         float w = ImGui::GetContentRegionAvail().x;
         float h = std::max(24.0f, (ImGui::GetContentRegionAvail().y - 8) / 2);
         const size_t totalBins = video.peaks.size() / 2;
+        const bool curves = haveScore && scoreSeg == current && !scoring && !quizHidden() && lastProsody.have && valid(current);
         if (valid(current)) {
             const auto& s = seg(current);
             size_t a = std::min(totalBins, (size_t)s.startMs / kPeakBinMs);
             size_t b = std::min(totalBins, (size_t)s.endMs / kPeakBinMs);
             float ph = (t * 1000 - s.startMs) / (float)(s.endMs - s.startMs);
+            const ImVec2 rectPos = ImGui::GetCursorScreenPos();
             drawWaveform(video.peaks.data() + 2 * a, b - a, ImVec2(w, h), IM_COL32(90, 170, 255, 255), mpv.paused() ? -1.0f : ph);
+            if (curves) {
+                const float segDur = (float)(s.endMs - s.startMs);
+                drawWordTicks(rectPos, ImVec2(w, h), segDur, false);
+                drawPitchCurve(rectPos, ImVec2(w, h), lastProsody.orig.semitone, nullptr, segDur, IM_COL32(255, 210, 80, 230), (float)lastProsody.origPadMs);
+            }
         } else {
             drawWaveform(nullptr, 0, ImVec2(w, h), 0, -1.0f);
         }
-        float ph2 = recPlayer.playing() && !myRec.empty() ? recPlayer.positionMs() / (float)AudioEngine::durationMs(myRec) : -1.0f;
-        drawWaveform(myRecPeaks.data(), myRecPeaks.size() / 2, ImVec2(w, h), IM_COL32(120, 230, 120, 255), ph2);
+        const float recDur = (float)AudioEngine::durationMs(myRec);
+        const bool mine = curves && !myRec.empty() && myRecPath == scoreRecPath;
+        const ImVec2 rectPos2 = ImGui::GetCursorScreenPos();
+        // 맞춤 모드: 내 말소리 구간 [uS, uE] 을 원음 말소리 구간 [oS, oE] 에 겹치도록 시간축을 옮기고 늘인다
+        float oS = 0, uS = 0, scale = 1;
+        bool aligned = false;
+        if (mine && alignWave && valid(current)) {
+            const auto& o = lastProsody.orig;
+            const auto& u = lastProsody.user;
+            oS = frameCenterMs(o.speechStart) - lastProsody.origPadMs;
+            const float oE = frameCenterMs(o.speechEnd) - lastProsody.origPadMs;
+            uS = frameCenterMs(u.speechStart);
+            const float uE = frameCenterMs(u.speechEnd);
+            if (oE - oS > 100 && uE - uS > 100) { scale = (oE - oS) / (uE - uS); aligned = true; }
+        }
+        if (aligned) {
+            const auto& s = seg(current);
+            const float segDur = (float)(s.endMs - s.startMs);
+            // 원음 시간축의 10 ms 칸마다 그 시각에 해당하는 내 녹음 피크를 가져온다
+            const size_t nBins = (size_t)std::max(1.0f, segDur / kPeakBinMs), userBins = myRecPeaks.size() / 2;
+            std::vector<float> mapped(nBins * 2, 0.0f);
+            for (size_t i = 0; i < nBins; ++i) {
+                const float tUser = ((float)i * kPeakBinMs + kPeakBinMs / 2 - oS) / scale + uS;
+                const long j = (long)(tUser / kPeakBinMs);
+                if (tUser >= 0 && j >= 0 && (size_t)j < userBins) { mapped[2 * i] = myRecPeaks[2 * j]; mapped[2 * i + 1] = myRecPeaks[2 * j + 1]; }
+            }
+            float ph2 = recPlayer.playing() ? ((recPlayer.positionMs() - uS) * scale + oS) / segDur : -1.0f;
+            drawWaveform(mapped.data(), nBins, ImVec2(w, h), IM_COL32(120, 230, 120, 255), ph2);
+            drawWordTicks(rectPos2, ImVec2(w, h), segDur, true, uS, scale, oS);
+            // 원음 곡선은 점선으로 같은 자리에, 내 곡선은 옮긴 시간축으로
+            static const std::vector<float> none;
+            drawPitchCurve(rectPos2, ImVec2(w, h), none, &lastProsody.orig.semitone, segDur, 0, (float)lastProsody.origPadMs);
+            drawPitchCurve(rectPos2, ImVec2(w, h), lastProsody.user.semitone, nullptr, segDur, IM_COL32(255, 210, 80, 255), uS, scale, oS);
+            drawWordPairTooltip(rectPos2, ImVec2(w, h), segDur, uS, scale, oS);
+        } else {
+            float ph2 = recPlayer.playing() && !myRec.empty() ? recPlayer.positionMs() / recDur : -1.0f;
+            drawWaveform(myRecPeaks.data(), myRecPeaks.size() / 2, ImVec2(w, h), IM_COL32(120, 230, 120, 255), ph2);
+            if (mine) {
+                drawWordTicks(rectPos2, ImVec2(w, h), recDur, true);
+                drawPitchCurve(rectPos2, ImVec2(w, h), lastProsody.user.semitone,
+                               lastProsody.result.haveAlignment ? &lastProsody.result.origOnUser : nullptr, recDur, IM_COL32(255, 210, 80, 255));
+                drawWordPairTooltip(rectPos2, ImVec2(w, h), recDur);
+            }
+        }
 
         ImGui::EndChild();
     }
@@ -2779,7 +3133,7 @@ struct App {
         if (ImGui::IsKeyPressed(ImGuiKey_P, false) && loaded && video.lang == Lang::Ja) { showPron = !showPron; db.setSetting("ja.showPron", showPron ? "1" : "0"); }
     }
 
-    // --script 파일의 명령을 한 줄씩 실행 (테스트용): load <id> / wait <sec> / play <n> / echo <n> / record / stop / quit
+    // --script 파일의 명령을 한 줄씩 실행 (테스트용): load <id> / wait <sec> / play <n> / echo <n> / record / stop / rescore / prosody_dump / quit
     void runScript() {
         if (scriptPos >= script.size() || Clock::now() < scriptWaitUntil) return;
         std::istringstream ss(script[scriptPos++]);
@@ -2823,9 +3177,23 @@ struct App {
                 setMyRec(AudioEngine::loadWav(path), path);
                 scoring = true;
                 haveScore = false;
+                lastProsody = ProsodyView{};
                 scoreSeg = current;
-                scoreJob.start(&sttCur(), 0, seg(current).text, myRec, video.lang, jaReady ? &jaDict : nullptr);
+                startScoreJob(0);
             }
+        }
+        else if (cmd == "prosody_dump") {  // 억양 · 리듬 · 강세 결과를 stderr 로 (자동 테스트용)
+            const auto& p = lastProsody.result;
+            auto sc = [](bool have, float v) { char b[16]; if (!have) return std::string("-"); snprintf(b, sizeof b, "%.0f", v); return std::string(b); };
+            fprintf(stderr, "[prosody] haveScore=%d scoring=%d tracks=%d acc=%.1f intonation=%s rhythm=%s%s stress=%s speed=%.2f pitchDiff=%.2f words=%d align=%d origFrames=%d userFrames=%d note=%s\n",
+                    (int)haveScore, (int)scoring, (int)lastProsody.have, lastScore.accuracy,
+                    sc(p.haveIntonation, p.intonation).c_str(), sc(p.haveRhythm, p.rhythm).c_str(), p.haveRhythm && p.rhythmSpeedOnly ? "(speedOnly)" : "",
+                    sc(p.haveStress, p.stress).c_str(), p.speedRatio, p.pitchDiffSt, (int)p.words.size(), (int)p.haveAlignment,
+                    lastProsody.orig.frames(), lastProsody.user.frames(), p.note.c_str());
+            for (const auto& hnt : p.hints) fprintf(stderr, "[prosody] hint[%d]: %s\n", hnt.refIdx, hnt.text.c_str());
+            for (const auto& wp : p.words)
+                fprintf(stderr, "[prosody] word '%s' orig %d-%d user %d-%d dur x%.2f loud %+.2f pitch %+.1f%s\n", wp.text.c_str(),
+                        wp.origStartMs, wp.origEndMs, wp.userStartMs, wp.userEndMs, wp.durRatio, wp.loudDiff, wp.pitchDiffSt, wp.hasPitch ? "" : " (no pitch)");
         }
         else if (cmd == "review") startSession();
         else if (cmd == "rate") rateCurrent(arg == "hard" ? Db::Hard : arg == "easy" ? Db::Easy : Db::Good);
@@ -2915,7 +3283,7 @@ struct App {
             drawHome(avail);
         } else {
             const float rightW = std::clamp(avail.x * 0.34f, 280.0f * uiScale, 520.0f * uiScale);
-            const float bottomH = 330.0f * uiScale;
+            const float bottomH = 360.0f * uiScale;  // 파형 두 줄에 음높이 곡선과 단어 눈금이 들어갈 높이
             drawVideoPanel(ImVec2(avail.x - rightW - 8, avail.y - bottomH - 8));
             ImGui::SameLine();
             drawRightPanel(ImVec2(rightW, avail.y - bottomH - 8));

@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cmath>
 #include <sstream>
 
 namespace {
@@ -111,4 +112,54 @@ ScoreResult scoreTranscript(const std::string& reference, const std::string& hyp
     r.marks.assign(rev.rbegin(), rev.rend());
     r.accuracy = n ? 100.0f * r.matched / (float)n : 0.0f;
     return r;
+}
+
+std::vector<std::string> scoringTokens(const std::string& text, Lang lang) {
+    std::vector<std::string> out;
+    for (const auto& t : (lang == Lang::Ja ? tokenizeJa(text) : tokenize(text))) out.push_back(t.display);
+    return out;
+}
+
+std::vector<int> alignTokens(const std::string& reference, const std::vector<std::string>& hypTokens, Lang lang) {
+    const auto R = lang == Lang::Ja ? tokenizeJa(reference) : tokenize(reference);
+    std::vector<std::string> H;
+    for (const auto& h : hypTokens) {
+        auto t = lang == Lang::Ja ? tokenizeJa(h) : tokenize(h);
+        // 인식 단어 하나가 토큰 하나가 아닐 수 있다 (추임새 → 0개, 일본어 → 여러 글자). 첫 토큰의 정규형으로 대표하고 빈 것은 빈 문자열
+        H.push_back(t.empty() ? std::string() : t[0].norm);
+    }
+    const size_t n = R.size(), m = H.size();
+    // 치환 비용은 두 단어가 비슷할수록 싸다 (ears ↔ years 0.3, ears ↔ yeah 0.7). 비용이 같은 길이 여럿일 때
+    // 엉뚱한 단어에 붙는 것을 막는다 — whisper 가 잘못 들은 단어는 대개 원래 단어와 철자가 비슷하다
+    auto subCost = [&](size_t i, size_t j) -> float {
+        const std::string& a = R[i].norm;
+        const std::string& b = H[j];
+        if (b.empty()) return 1.f;
+        if (a == b) return 0.f;
+        std::vector<int> prev(b.size() + 1), cur(b.size() + 1);
+        for (size_t y = 0; y <= b.size(); ++y) prev[y] = (int)y;
+        for (size_t x = 1; x <= a.size(); ++x) {
+            cur[0] = (int)x;
+            for (size_t y = 1; y <= b.size(); ++y)
+                cur[y] = std::min({prev[y - 1] + (a[x - 1] == b[y - 1] ? 0 : 1), prev[y] + 1, cur[y - 1] + 1});
+            std::swap(prev, cur);
+        }
+        const float d = (float)prev[b.size()] / (float)std::max(a.size(), b.size());
+        return 0.3f + 0.7f * d;
+    };
+    std::vector<std::vector<float>> dp(n + 1, std::vector<float>(m + 1, 0.f));
+    for (size_t i = 0; i <= n; ++i) dp[i][0] = (float)i;
+    for (size_t j = 0; j <= m; ++j) dp[0][j] = (float)j;
+    for (size_t i = 1; i <= n; ++i)
+        for (size_t j = 1; j <= m; ++j)
+            dp[i][j] = std::min({dp[i - 1][j - 1] + subCost(i - 1, j - 1), dp[i - 1][j] + 1.f, dp[i][j - 1] + 1.f});
+    std::vector<int> map(n, -1);
+    size_t i = n, j = m;
+    const float eps = 1e-4f;
+    while (i > 0 || j > 0) {
+        if (i > 0 && j > 0 && std::fabs(dp[i][j] - (dp[i - 1][j - 1] + subCost(i - 1, j - 1))) < eps) { map[i - 1] = (int)(j - 1); --i; --j; continue; }
+        if (i > 0 && std::fabs(dp[i][j] - (dp[i - 1][j] + 1.f)) < eps) --i;
+        else --j;
+    }
+    return map;
 }

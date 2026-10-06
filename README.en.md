@@ -40,6 +40,8 @@ Paste a link and it downloads the video with English subtitles, splits them into
   - Record only: record right away without hearing the original (for drilling the same sentence)
   - Auto-stop on silence (background noise is measured to auto-tune sensitivity), or press Space to stop manually
 - **Scoring**: your recording is transcribed with whisper and aligned word by word against the original. Shows accuracy % with correct / missing / misheard / extra words. Fillers ("uh", "um") and sound-effect tags are ignored
+  - **Intonation · rhythm · stress**: three more scores next to the accuracy, computed offline on your PC with no AI. Intonation converts both the original speaker's and your pitch curves to semitones relative to each speaker's own median (so a high or low voice does not matter), aligns them in time with DTW and compares. Rhythm uses whisper word timings to compare per-word duration ratios, pauses and overall speed; stress compares per-word relative loudness. Both pitch curves and word ticks are drawn over the waveforms (your waveform also carries the original curve as a dashed ghost), and each word button shows what to change there ("길게 · 세게 · 높게" = longer · stronger · higher). **Right-click** a word to hear the original speaker's word followed by yours. Word timings come from whisper's DTW token alignment, trimmed to the audio; because subtitle cues drift from the actual speech, the original is read with 300 ms of margin on both sides and only the words matching the reference sentence are used
+  - The first time a sentence is scored the original clip is also transcribed once with whisper to get word timings, so it takes about twice as long; the timings are cached after that. Sources with loud background music are less reliable, and anything that cannot be measured is hidden rather than shown as 0
 - **Sentence drills** ([학습] tab)
   - Listening: hear a sentence with subtitles hidden and type what you heard. Scored word by word, ignoring case and punctuation
   - Composition: see only the Korean translation (from the AI explanation) and write the English sentence (the translation can be generated on the spot)
@@ -203,6 +205,7 @@ src/
   local.cpp       local video registration (ID, subtitle lookup, embedded-track extraction, audio extraction)
   stt.cpp         whisper.cpp wrapper (word timestamps / text)
   scoring.cpp     edit-distance alignment of original vs recognized text, accuracy
+  prosody.cpp     intonation · rhythm · stress: F0 extraction, semitone normalization, DTW alignment, per-word duration/loudness comparison
   audio.cpp       miniaudio record/playback, waveform peaks, resampling
   db.cpp          SQLite storage, spaced repetition, stats, settings, explanation cache, expression cards
   llm.cpp         Claude / OpenAI / Gemini REST calls, explanation prompt
@@ -212,18 +215,19 @@ src/
   paths.cpp       data/model paths, bundled-tool PATH, hidden process execution
   main.cpp        CLI version (early prototype)
   stt_test.cpp    STT + scoring test tool
+  prosody_test.cpp  intonation · rhythm · stress analysis test tool
 scripts/setup-deps.ps1 · .sh   dependency setup (Windows · macOS)
 scripts/package.ps1 · .sh      release packaging (Windows · macOS)
 installer/youshadow.iss  Inno Setup script
 .github/workflows/release.yml  build & Release on tag push
 ```
 
-For testing, `youshadow-gui --script cmds.txt` runs commands in order: `load <id>` / `wait <sec>` / `play <n>` / `echo <n>` / `record` / `home` / `review` / `rate hard|good|easy` / `explain` / `explain_all` / `settings` / `tab <name>` / `quit`. The demo GIF was captured this way. `llm_test <claude|openai|gemini> <API key>` tries one sentence explanation from the console.
+For testing, `youshadow-gui --script cmds.txt` runs commands in order: `load <id>` / `wait <sec>` / `play <n>` / `echo <n>` / `record` / `home` / `review` / `rate hard|good|easy` / `explain` / `explain_all` / `settings` / `tab <name>` / `rescore` (re-score the current sentence's last recording) / `prosody_dump` (print intonation · rhythm · stress results to stderr) / `quit`. The demo GIF was captured this way. `llm_test <claude|openai|gemini> <API key>` tries one sentence explanation from the console, and `prosody_test` exercises the intonation · rhythm · stress analysis from the console.
 
 ## Good to know
 
 - YouTube sometimes temporarily blocks subtitle requests (HTTP 429). In that case a whisper transcript is generated; reloading a few hours later usually gets the subtitles.
-- Scoring runs the whisper base.en model on the CPU — about 0.4s for a 10-second recording.
+- Scoring runs the whisper base.en model on the CPU — about 0.4s for a 10-second recording. The first time a sentence is scored the original clip is transcribed once as well (for intonation · rhythm), so it takes about twice as long; the result is cached and later scorings are fast.
 - This program was built for personal study. Downloading videos is your own responsibility; check the YouTube Terms of Service.
 
 ## AI usage disclosure
@@ -234,7 +238,7 @@ The design and code of this project were written in conversation with Anthropic'
 
 - Sentence editing (split / merge)
 - Larger whisper models (small.en), GPU acceleration
-- Intonation/pace comparison, phoneme-level pronunciation feedback
+- Phoneme-level pronunciation feedback (the sounds themselves: r/l, th)
 
 ## Dictionary data sources
 

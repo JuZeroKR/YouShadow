@@ -78,7 +78,8 @@ struct PracticeHistory {
     std::string mode;
     std::string at;
     std::string recordingPath;
-    double score = -1;
+    double score = -1;                              // 단어 정확도 (-1: 없음)
+    double intonation = -1, rhythm = -1, stress = -1;  // 억양 · 리듬 · 강세 0~100 (-1: 측정 못 함)
 };
 
 // SQLite 기반 학습 기록. 문장(세그먼트) 단위로 연습 이력, 간격 반복 상태, 북마크를 저장한다.
@@ -97,6 +98,8 @@ public:
     // 연습 이력
     long long addPractice(const PracticeRow& row);   // rowid 반환
     void setPracticeScore(long long id, double score);
+    // 억양 · 리듬 · 강세 점수. 음수면 NULL (측정 못 함). score(단어 정확도) 는 그대로 둔다.
+    void setPracticeProsody(long long id, double intonation, double rhythm, double stress);
     std::map<int, int> countsFor(const std::string& videoId) const;
     std::map<int, double> bestScoresFor(const std::string& videoId) const;
     std::string lastRecording(const std::string& videoId, int segIdx) const;
@@ -134,6 +137,10 @@ public:
     // 일본어 읽기(토큰 · 후리가나 · 한국어 발음) 캐시 (문장 기준, JSON)
     std::string getReading(const std::string& videoId, int segIdx) const;
     void setReading(const std::string& videoId, int segIdx, const std::string& json);
+
+    // 원음 문장의 whisper 단어 시각 캐시 (문장 기준, JSON). 억양 · 리듬 비교에서 원음 인식을 문장당 한 번만 하기 위해 저장한다.
+    std::string getSegWords(const std::string& videoId, int segIdx) const;
+    void setSegWords(const std::string& videoId, int segIdx, const std::string& json);
 
     // 표현 카드 (간격 반복 포함)
     long long addExpression(const std::string& videoId, int segIdx, const std::string& text,

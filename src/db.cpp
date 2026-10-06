@@ -66,11 +66,29 @@ CREATE TABLE IF NOT EXISTS word_meanings(
   word TEXT, sentence TEXT, json TEXT, created_at TEXT, PRIMARY KEY(word, sentence));
 CREATE TABLE IF NOT EXISTS readings(
   video_id TEXT, seg_idx INTEGER, json TEXT, created_at TEXT, PRIMARY KEY(video_id, seg_idx));
+CREATE TABLE IF NOT EXISTS seg_words(
+  video_id TEXT, seg_idx INTEGER, json TEXT, created_at TEXT, PRIMARY KEY(video_id, seg_idx));
 )";
 
 // 스키마 버전 (PRAGMA user_version). 기존 테이블에 컬럼을 더할 때만 올린다 — 테이블 생성은 IF NOT EXISTS 로 충분하다.
 //  1: videos.lang (학습 언어, 'en' / 'ja')
-constexpr int kSchemaVersion = 1;
+//  2: practices.intonation / rhythm / stress (억양 · 리듬 · 강세 점수, NULL 이면 측정 못 함)
+constexpr int kSchemaVersion = 2;
+
+// 테이블에 컬럼이 없으면 더한다 (이미 있으면 그대로)
+void addColumnIfMissing(sqlite3* db, const std::string& table, const std::string& column, const std::string& decl) {
+    bool has = false;
+    Stmt st(db, "PRAGMA table_info(" + table + ")");
+    while (st.step()) if (st.colText(1) == column) has = true;
+    if (has) return;
+    const std::string sql = "ALTER TABLE " + table + " ADD COLUMN " + column + " " + decl;
+    char* msg = nullptr;
+    if (sqlite3_exec(db, sql.c_str(), nullptr, nullptr, &msg) != SQLITE_OK) {
+        std::string e = msg ? msg : "unknown";
+        sqlite3_free(msg);
+        throw std::runtime_error("sqlite exec: " + e);
+    }
+}
 
 const char* kReviewSelect =
     "SELECT s.video_id, COALESCE(v.title, s.video_id), s.seg_idx, COALESCE(g.start_ms, 0), COALESCE(g.text, ''), COALESCE(s.due_at, ''), COALESCE(v.lang, 'en') "
@@ -126,6 +144,11 @@ bool Db::open(const std::string& path, std::string* err) {
             while (st.step()) if (st.colText(1) == "lang") hasLang = true;
             if (!hasLang) exec("ALTER TABLE videos ADD COLUMN lang TEXT DEFAULT 'en'");
         }
+        if (ver < 2) {
+            addColumnIfMissing(db_, "practices", "intonation", "REAL");
+            addColumnIfMissing(db_, "practices", "rhythm", "REAL");
+            addColumnIfMissing(db_, "practices", "stress", "REAL");
+        }
         if (ver < kSchemaVersion) exec("PRAGMA user_version=" + std::to_string(kSchemaVersion));
     } catch (const std::exception& e) {
         if (err) *err = e.what();
@@ -178,6 +201,15 @@ long long Db::addPractice(const PracticeRow& row) {
 
 void Db::setPracticeScore(long long id, double score) {
     Stmt(db_, "UPDATE practices SET score=? WHERE id=?").bind(1, score).bind(2, id).run();
+}
+
+void Db::setPracticeProsody(long long id, double intonation, double rhythm, double stress) {
+    // 바인딩하지 않은 자리는 NULL 로 들어간다
+    Stmt st(db_, "UPDATE practices SET intonation=?, rhythm=?, stress=? WHERE id=?");
+    if (intonation >= 0) st.bind(1, intonation);
+    if (rhythm >= 0) st.bind(2, rhythm);
+    if (stress >= 0) st.bind(3, stress);
+    st.bind(4, id).run();
 }
 
 std::map<int, int> Db::countsFor(const std::string& videoId) const {
@@ -332,16 +364,19 @@ std::vector<DayStat> Db::dailyStats(int days) const {
 
 std::vector<PracticeHistory> Db::practicesFor(const std::string& videoId, int segIdx) const {
     std::vector<PracticeHistory> out;
-    Stmt st(db_, "SELECT id, mode, at, COALESCE(recording_path, ''), score FROM practices "
+    Stmt st(db_, "SELECT id, mode, at, COALESCE(recording_path, ''), score, intonation, rhythm, stress FROM practices "
                  "WHERE video_id = ? AND seg_idx = ? ORDER BY id DESC");
     st.bind(1, videoId).bind(2, segIdx);
     while (st.step()) {
         PracticeHistory h;
-        h.id = st.colInt(0);
+        h.id = st.colInt64(0);
         h.mode = st.colText(1);
         h.at = st.colText(2);
         h.recordingPath = st.colText(3);
         h.score = st.colNull(4) ? -1 : st.colDouble(4);
+        h.intonation = st.colNull(5) ? -1 : st.colDouble(5);
+        h.rhythm = st.colNull(6) ? -1 : st.colDouble(6);
+        h.stress = st.colNull(7) ? -1 : st.colDouble(7);
         out.push_back(h);
     }
     return out;
@@ -357,6 +392,7 @@ void Db::deleteVideo(const std::string& videoId) {
     Stmt(db_, "DELETE FROM practices WHERE video_id = ?").bind(1, videoId).run();
     Stmt(db_, "DELETE FROM segment_state WHERE video_id = ?").bind(1, videoId).run();
     Stmt(db_, "DELETE FROM segments WHERE video_id = ?").bind(1, videoId).run();
+    Stmt(db_, "DELETE FROM seg_words WHERE video_id = ?").bind(1, videoId).run();  // 문장이 다시 나뉠 수 있으니 원음 단어 캐시도 지운다
     Stmt(db_, "DELETE FROM videos WHERE id = ?").bind(1, videoId).run();
     exec("COMMIT");
 }
@@ -404,6 +440,17 @@ std::string Db::getReading(const std::string& videoId, int segIdx) const {
 
 void Db::setReading(const std::string& videoId, int segIdx, const std::string& json) {
     Stmt(db_, "INSERT OR REPLACE INTO readings(video_id, seg_idx, json, created_at) VALUES(?,?,?,?)")
+        .bind(1, videoId).bind(2, segIdx).bind(3, json).bind(4, now()).run();
+}
+
+std::string Db::getSegWords(const std::string& videoId, int segIdx) const {
+    Stmt st(db_, "SELECT json FROM seg_words WHERE video_id=? AND seg_idx=?");
+    st.bind(1, videoId).bind(2, segIdx);
+    return st.step() ? st.colText(0) : "";
+}
+
+void Db::setSegWords(const std::string& videoId, int segIdx, const std::string& json) {
+    Stmt(db_, "INSERT OR REPLACE INTO seg_words(video_id, seg_idx, json, created_at) VALUES(?,?,?,?)")
         .bind(1, videoId).bind(2, segIdx).bind(3, json).bind(4, now()).run();
 }
 
