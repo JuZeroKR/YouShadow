@@ -75,5 +75,9 @@ Result compare(const Track& orig, const std::vector<Word>& origWords,
 // JSON 직렬화 (DB 캐시 · 테스트 출력용). words 는 Word 배열 [{"t":..,"s":..,"e":..}]
 std::string wordsToJson(const std::vector<Word>& words);
 std::vector<Word> wordsFromJson(const std::string& json);
+// 클립 기준 정보를 함께 담는 형식 {"base":클립 시작(영상 절대 ms),"pad":앞뒤 여유 ms,"words":[...]}. 원음 단어 시각 캐시(seg_words)에 쓴다.
+// 읽을 때 옛 형식(배열만)이면 base/pad 에 -1 을 돌려준다
+std::string wordsToJson(const std::vector<Word>& words, int baseMs, int padMs);
+std::vector<Word> wordsFromJson(const std::string& json, int* baseMs, int* padMs);
 
 }  // namespace prosody

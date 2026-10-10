@@ -620,6 +620,33 @@ std::string wordsToJson(const std::vector<Word>& words) {
     }
 }
 
+std::string wordsToJson(const std::vector<Word>& words, int baseMs, int padMs) {
+    try {
+        nlohmann::json doc;
+        doc["base"] = baseMs;
+        doc["pad"] = padMs;
+        doc["words"] = nlohmann::json::parse(wordsToJson(words));
+        return doc.dump(-1, ' ', false, nlohmann::json::error_handler_t::replace);
+    } catch (...) {
+        return wordsToJson(words);
+    }
+}
+
+std::vector<Word> wordsFromJson(const std::string& json, int* baseMs, int* padMs) {
+    if (baseMs) *baseMs = -1;
+    if (padMs) *padMs = -1;
+    try {
+        const auto doc = nlohmann::json::parse(json);
+        if (doc.is_array()) return wordsFromJson(json);
+        if (!doc.is_object() || !doc.contains("words")) return {};
+        if (baseMs && doc.contains("base") && doc["base"].is_number()) *baseMs = doc["base"].get<int>();
+        if (padMs && doc.contains("pad") && doc["pad"].is_number()) *padMs = doc["pad"].get<int>();
+        return wordsFromJson(doc["words"].dump());
+    } catch (...) {
+        return {};
+    }
+}
+
 std::vector<Word> wordsFromJson(const std::string& json) {
     try {
         const auto doc = nlohmann::json::parse(json);

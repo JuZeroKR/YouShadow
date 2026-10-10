@@ -284,13 +284,19 @@ struct ScoreJob {
                         pr.note = "원음 구간을 읽지 못해 억양 비교 생략";
                     } else {
                         std::vector<Word> origWords;
-                        if (!origWordsJson.empty()) origWords = prosody::wordsFromJson(origWordsJson);
+                        if (!origWordsJson.empty()) {
+                            // 캐시는 자기 클립(base) 기준 시각이다. 옛 형식(base 없음)은 이 클립과 같은 300 ms 여유 기준
+                            int base = -1, cachedPad = -1;
+                            origWords = prosody::wordsFromJson(origWordsJson, &base, &cachedPad);
+                            const int myClipStart = segStart - padFront;
+                            if (base >= 0 && base != myClipStart) for (auto& w : origWords) { w.startMs += base - myClipStart; w.endMs += base - myClipStart; }
+                        }
                         if (origWords.empty()) {
                             // 캐시가 없으면 원음을 한 번 인식한다 (문장당 한 번, 결과는 DB 에 저장). 빈 결과는 저장하지 않는다
                             std::string e2;
                             origWords = stt->transcribe(origPcm, {}, &e2);
                             fresh = e2.empty() && !origWords.empty();
-                            if (fresh) origJson = prosody::wordsToJson(origWords);
+                            if (fresh) origJson = prosody::wordsToJson(origWords, segStart - padFront, pad);
                         }
                         // 넓힌 구간에 들어온 이웃 대사의 단어는 빼고, 기준 문장과 맞는 단어만으로 말소리 구간을 잡는다
                         std::vector<Word> matched;
@@ -327,8 +333,10 @@ struct ScoreJob {
     ~ScoreJob() { if (th.joinable()) th.join(); }
 };
 
-// 원음 문장의 단어 시각만 인식한다 (파형 위에 단어를 적기 위해). 채점 때와 같은 넓힌 클립 · 같은 JSON 이라 결과는 같은 DB 캐시에 들어간다
+// 원음 문장의 단어 시각만 인식한다 (파형 위에 단어를 적고, 자막 시각이 실제 말과 어긋난 문장의 실제 구간을 잡기 위해).
+// 자막 큐가 1초 넘게 어긋나는 일도 있어 앞뒤 kWidePadMs 를 넓혀 읽고, 기준 문장과 맞는 단어만 쓴다. 결과는 채점과 같은 DB 캐시(seg_words)에 들어간다
 struct OrigWordsJob {
+    static constexpr int kWidePadMs = 1500;
     std::thread th;
     std::mutex m;
     bool running = false, done = false;
@@ -345,11 +353,12 @@ struct OrigWordsJob {
         th = std::thread([this, stt, audioPath, segStart, segEnd, lang] {
             std::string json;
             try {
-                const int pad = lang == Lang::Ja ? 0 : ScoreJob::kOrigPadMs;
-                auto pcm = AudioEngine::loadWavSlice(audioPath, segStart - std::min(pad, segStart), segEnd + pad, Stt::kRate);
+                const int pad = lang == Lang::Ja ? 0 : kWidePadMs;
+                const int clipStart = segStart - std::min(pad, segStart);
+                auto pcm = AudioEngine::loadWavSlice(audioPath, clipStart, segEnd + pad, Stt::kRate);
                 std::string e;
                 auto words = stt->transcribe(pcm, {}, &e);
-                if (e.empty() && !words.empty()) json = prosody::wordsToJson(words);
+                if (e.empty() && !words.empty()) json = prosody::wordsToJson(words, clipStart, pad);
             } catch (const std::exception&) {}
             std::lock_guard<std::mutex> lock(m);
             jsonOut = std::move(json);
@@ -478,9 +487,13 @@ struct App {
     Stt& sttCur() { return sttFor(curLang()); }
     ScoreJob scoreJob;
     OrigWordsJob origWordsJob;
-    // 문장 번호 → 원음 단어 (기준 문장과 맞는 것만, 문장 시작 기준 ms). 영상을 열 때 비운다
-    std::map<int, std::vector<Word>> origWordsCache;
+    // 문장 번호 → 원음 단어 (기준 문장과 맞는 것만, 영상 절대 ms). wide 는 넓은 창(앞뒤 1.5초)으로 인식한 것 — 그때만 실제 구간을 믿는다. 영상을 열 때 비운다
+    struct OrigWords { std::vector<Word> words; bool wide = false; int leadMiss = 0, tailMiss = 0; };  // leadMiss/tailMiss: 기준 문장 앞뒤에서 인식 못 한 단어 수
+    std::map<int, OrigWords> origWordsCache;
     std::set<int> origWordsTried;  // 인식을 시도한 문장 (실패해도 다시 돌리지 않는다)
+    std::vector<Word> origRelScratch;  // origWordsFor 가 돌려주는, 구간 시작 기준으로 옮긴 사본
+    // 문장의 실제 재생 구간 (ms). 자막 큐가 실제 말과 어긋난 문장은 whisper 단어 시각으로 잡은 구간
+    struct Span { int startMs = 0, endMs = 0; };
 
     LoadedVideo video;
     bool loaded = false;
@@ -529,7 +542,7 @@ struct App {
     int scoreSeg = -1;
     ScoreResult lastScore;
     // 억양 · 리듬 · 강세 (채점 결과와 함께 들어온다). have 가 true 면 곡선(orig / user) 을 그릴 수 있다
-    struct ProsodyView { prosody::Result result; prosody::Track orig, user; bool have = false; int origPadMs = 0; } lastProsody;
+    struct ProsodyView { prosody::Result result; prosody::Track orig, user; bool have = false; int origPadMs = 0; int segStartMs = 0; } lastProsody;
     std::string scoreRecPath;   // 채점한 녹음 파일. 기록 탭에서 다른 녹음을 들을 땐 그 파형에 곡선을 겹치지 않는다
 
     // 홈(라이브러리) 화면
@@ -832,10 +845,10 @@ struct App {
         mpv.seek(sec);
         seekGrace = Clock::now() + std::chrono::milliseconds(300);
     }
-    bool pastSegmentEnd(double t) const {
+    bool pastSegmentEnd(double t) {  // spanOf 가 인식을 걸 수 있어 const 가 아니다
         if (!valid(current)) return false;
         if (Clock::now() < seekGrace || mpv.seeking()) return false;
-        return t >= seg(current).endMs / 1000.0;
+        return t >= spanOf(current).endMs / 1000.0;
     }
 
     void refreshStats() {
@@ -1115,9 +1128,10 @@ struct App {
     // 현재 문장 · myRec 으로 채점 작업 시작 (단어 정확도 + 억양 · 리듬 · 강세). 원음 단어 시각 캐시가 있으면 함께 넘긴다
     void startScoreJob(long long pid) {
         const auto& s = seg(current);
+        const Span sp = spanOf(current);
         scoreRecPath = myRecPath;
         scoreJob.start(&sttCur(), pid, s.text, myRec, video.lang, jaReady ? &jaDict : nullptr,
-                       video.audioPath, s.startMs, s.endMs, db.getSegWords(video.id, current), video.id, current);
+                       video.audioPath, sp.startMs, sp.endMs, db.getSegWords(video.id, current), video.id, current);
     }
 
     // 녹음 종료 → 저장, 기록, 채점 시작
@@ -1140,8 +1154,11 @@ struct App {
     // 문장 재생을 시작할 시각. 자막 시각은 실제 첫 단어보다 수십~수백 ms 늦은 일이 많아 ("You're gonna" 의 "You're" 가 잘려 들린다)
     // 기본 200 ms 앞에서 시작하고, 원음 단어 시각 캐시가 있으면 첫 단어가 그 안에 들어오도록 더 당긴다 (최대 300 ms, 시킹 유예 안).
     // 앞 문장 꼬리가 섞이지 않게 앞 문장 끝 + 60 ms 보다는 당기지 않는다 (단, 80 ms 는 보장)
+    // whisper 로 잡은 실제 구간이 있으면 (첫 단어 100 ms 앞) 그대로 쓴다
     int playStartMs(int i) {
         const auto& s = seg(i);
+        const Span sp = spanOf(i);
+        if (sp.startMs != s.startMs) return sp.startMs;
         int lead = 200;
         if (const std::vector<Word>* ow = origWordsFor(i); ow && !ow->empty() && ow->front().startMs < 0) lead = std::max(lead, -ow->front().startMs + 100);
         lead = std::min(lead, 300);
@@ -1358,7 +1375,7 @@ struct App {
             case Mode::EchoListen:
                 if (pastSegmentEnd(t)) {
                     mpv.setPaused(true);
-                    const int dur = seg(current).endMs - seg(current).startMs;
+                    const int dur = spanOf(current).endMs - spanOf(current).startMs;
                     try { beginRecording(std::min(dur, 1500), dur * 3 + 10000); }
                     catch (const std::exception& e) { message = e.what(); mode = Mode::Idle; break; }
                     mode = Mode::EchoRecord;
@@ -1528,6 +1545,7 @@ struct App {
                         lastProsody.user = std::move(scoreJob.userTrack);
                         lastProsody.have = scoreJob.haveProsodyTracks;
                         lastProsody.origPadMs = scoreJob.origPadMs;
+                        lastProsody.segStartMs = scoreJob.segStartMs;
                     }
                     if (loaded) bestScores = db.bestScoresFor(video.id);
                 } else {
@@ -1535,48 +1553,124 @@ struct App {
                 }
             }
         }
-        // 원음 단어 시각 (파형 단어 표시용) 수거
+        // 원음 단어 시각 (파형 단어 표시 · 실제 구간용) 수거. 다음 문장 미리 인식은 잠금을 푼 뒤에 건다 (start 가 같은 잠금을 잡는다)
         {
-            std::lock_guard<std::mutex> lock(origWordsJob.m);
-            if (origWordsJob.done) {
-                origWordsJob.done = false;
-                origWordsJob.running = false;
-                if (!origWordsJob.jsonOut.empty() && loaded && origWordsJob.videoId == video.id && valid(origWordsJob.segIdx)) {
-                    db.setSegWords(video.id, origWordsJob.segIdx, origWordsJob.jsonOut);
-                    origWordsCache.erase(origWordsJob.segIdx);
+            bool finished = false;
+            {
+                std::lock_guard<std::mutex> lock(origWordsJob.m);
+                if (origWordsJob.done) {
+                    origWordsJob.done = false;
+                    origWordsJob.running = false;
+                    finished = true;
+                    if (!origWordsJob.jsonOut.empty() && loaded && origWordsJob.videoId == video.id && valid(origWordsJob.segIdx)) {
+                        db.setSegWords(video.id, origWordsJob.segIdx, origWordsJob.jsonOut);
+                        origWordsCache.erase(origWordsJob.segIdx);
+                    }
                 }
             }
+            if (finished) prefetchOrigWords();
         }
     }
 
-    // 문장 i 의 원음 단어 시각 (문장 시작 기준 ms, 기준 문장과 맞는 단어만). DB 캐시가 없으면 STT 로 한 번 인식을 걸어 두고 nullptr
-    const std::vector<Word>* origWordsFor(int i) {
+    // 다음 문장 두 개를 미리 인식해 둔다 (한 번에 하나씩, 앞 작업이 끝날 때마다). 문장을 넘기자마자 실제 구간으로 재생되게
+    void prefetchOrigWords() {
+        if (!loaded || !valid(current) || video.lang == Lang::Ja) return;
+        for (int k = current + 1; k <= current + 2 && valid(k); ++k) {
+            bool busy; { std::lock_guard<std::mutex> lock(origWordsJob.m); busy = origWordsJob.running; }
+            if (busy) return;
+            origAbs(k);  // 캐시가 없거나 좁은 창이면 인식을 건다
+        }
+    }
+
+    // 넓은 창 인식을 걸 수 있으면 건다 (한 번에 하나, 채점 중에는 안 건다)
+    void requestOrigWords(int i) {
+        bool busy; { std::lock_guard<std::mutex> lock(origWordsJob.m); busy = origWordsJob.running; }
+        if (busy || scoring || !sttCur().loaded() || origWordsTried.count(i) || video.audioPath.empty()) return;
+        origWordsTried.insert(i);
+        origWordsJob.start(&sttCur(), video.audioPath, seg(i).startMs, seg(i).endMs, video.lang, video.id, i);
+    }
+
+    // 문장 i 의 원음 단어 (영상 절대 ms, 기준 문장과 맞는 단어만). DB 캐시가 없으면 인식을 걸어 두고 nullptr.
+    // 좁은 창(채점 때 300 ms 여유, 옛 형식)으로 인식한 캐시는 일단 쓰되 넓은 창으로 다시 인식을 건다
+    const OrigWords* origAbs(int i) {
         if (!loaded || !valid(i)) return nullptr;
-        if (auto it = origWordsCache.find(i); it != origWordsCache.end()) return &it->second;
+        if (auto it = origWordsCache.find(i); it != origWordsCache.end()) {
+            if (!it->second.wide && video.lang != Lang::Ja) requestOrigWords(i);
+            return &it->second;
+        }
         const auto& s = seg(i);
         const std::string json = db.getSegWords(video.id, i);
-        if (json.empty()) {
-            bool busy; { std::lock_guard<std::mutex> lock(origWordsJob.m); busy = origWordsJob.running; }
-            if (!busy && !scoring && sttCur().loaded() && !origWordsTried.count(i) && !video.audioPath.empty()) {
-                origWordsTried.insert(i);
-                origWordsJob.start(&sttCur(), video.audioPath, s.startMs, s.endMs, video.lang, video.id, i);
-            }
-            return nullptr;
-        }
-        // 캐시는 앞에 여유를 붙인 클립 기준 시각이다. 이웃 대사의 단어는 빼고 문장 시작 기준으로 옮긴다
-        std::vector<Word> all = prosody::wordsFromJson(json), out;
-        const int padFront = std::min(video.lang == Lang::Ja ? 0 : ScoreJob::kOrigPadMs, s.startMs);
+        if (json.empty()) { requestOrigWords(i); return nullptr; }
+        int base = -1, pad = -1;
+        std::vector<Word> all = prosody::wordsFromJson(json, &base, &pad);
+        if (base < 0) base = s.startMs - std::min(video.lang == Lang::Ja ? 0 : ScoreJob::kOrigPadMs, s.startMs);  // 옛 형식: 300 ms 여유 클립
+        OrigWords ow;
+        ow.wide = pad >= OrigWordsJob::kWidePadMs;
         if (video.lang != Lang::Ja) {
+            // 넓힌 창에 들어온 이웃 대사의 단어는 빼고 기준 문장과 맞는 단어만
             std::vector<std::string> texts;
             for (const auto& w : all) texts.push_back(w.text);
             std::vector<char> used(all.size(), 0);
-            for (int j : alignTokens(s.text, texts, video.lang)) if (j >= 0) used[j] = 1;
-            for (size_t k = 0; k < all.size(); ++k) if (used[k]) out.push_back(all[k]);
+            const std::vector<int> al = alignTokens(s.text, texts, video.lang);
+            for (int j : al) if (j >= 0) used[j] = 1;
+            for (size_t k = 0; k < all.size(); ++k) if (used[k]) ow.words.push_back(all[k]);
+            // 문장 앞뒤에서 못 알아들은 단어 수 ("I let this…" 를 "Get this…" 로 들으면 앞 2개) → 구간을 그만큼 더 넓힌다
+            for (int j : al) { if (j >= 0) break; ++ow.leadMiss; }
+            for (auto it = al.rbegin(); it != al.rend() && *it < 0; ++it) ++ow.tailMiss;
         } else {
-            out = all;
+            ow.words = all;
         }
-        for (auto& w : out) { w.startMs -= padFront; w.endMs -= padFront; }
-        return &(origWordsCache[i] = std::move(out));
+        for (auto& w : ow.words) { w.startMs += base; w.endMs += base; }
+        if (video.lang != Lang::Ja && ow.words.size() >= 2) {
+            // 이웃 대사의 같은 단어("you", "supervision") 가 잘못 붙는 것을 막는다: 700 ms 넘는 쉼으로 덩어리를 나누고,
+            // 단어가 가장 많은 덩어리를 중심으로 자막 큐 안(±200 ms)에 걸치는 이웃 덩어리까지만 남긴다 ("Yeah. … If you run" 처럼 큐 안의 쉼은 유지)
+            std::vector<std::pair<size_t, size_t>> clusters;  // [from, to)
+            for (size_t k = 0; k < ow.words.size(); ++k) {
+                if (k == 0 || ow.words[k].startMs - ow.words[k - 1].endMs > 700) clusters.push_back({k, k + 1});
+                else clusters.back().second = k + 1;
+            }
+            size_t best = 0;
+            for (size_t c = 1; c < clusters.size(); ++c)
+                if (clusters[c].second - clusters[c].first > clusters[best].second - clusters[best].first) best = c;
+            auto inCue = [&](size_t c) { return ow.words[clusters[c].second - 1].endMs > s.startMs - 200 && ow.words[clusters[c].first].startMs < s.endMs + 200; };
+            size_t lo = best, hi = best;
+            while (lo > 0 && inCue(lo - 1)) --lo;
+            while (hi + 1 < clusters.size() && inCue(hi + 1)) ++hi;
+            ow.words = std::vector<Word>(ow.words.begin() + clusters[lo].first, ow.words.begin() + clusters[hi].second);
+        }
+        const OrigWords* out = &(origWordsCache[i] = std::move(ow));
+        if (!out->wide && video.lang != Lang::Ja) requestOrigWords(i);
+        return out;
+    }
+
+    // 문장 i 의 실제 재생 구간. 넓은 창으로 인식한 단어가 충분히 맞으면 첫 단어 100 ms 앞 ~ 마지막 단어 150 ms 뒤, 아니면 자막 큐 그대로.
+    // 자막 큐에서 1.5초 넘게 벗어나지는 않는다 (인식 오류 보호)
+    Span spanOf(int i) {
+        const auto& s = seg(i);
+        Span sp{s.startMs, s.endMs};
+        if (!valid(i) || video.lang == Lang::Ja) return sp;
+        const OrigWords* ow = origAbs(i);
+        if (!ow || !ow->wide || ow->words.empty()) return sp;
+        const size_t need = std::max<size_t>(2, (scoringTokens(s.text, video.lang).size() + 1) / 2);
+        if (ow->words.size() < need) return sp;
+        const int lim = OrigWordsJob::kWidePadMs;
+        // 시작: 첫 단어 100 ms 앞, 앞에서 못 알아들은 단어마다 250 ms 더. 끝: 마지막 단어 150 ms 뒤 — 다만 whisper 가 끝 단어 시각을 뭉개는 일이
+        // 있어 자막 큐 끝이 그보다 늦으면 700 ms 까지는 큐 끝을 따른다 (말이 잘리는 것이 조용한 꼬리보다 나쁘다)
+        const int first = ow->words.front().startMs, last = ow->words.back().endMs;
+        sp.startMs = std::clamp(first - 100 - 250 * ow->leadMiss, s.startMs - lim, s.startMs + lim);
+        sp.endMs = std::clamp(std::max(last + 150, std::min(s.endMs, last + 700)) + 250 * ow->tailMiss, s.endMs - lim, s.endMs + lim);
+        if (sp.endMs - sp.startMs < 300) return Span{s.startMs, s.endMs};
+        return sp;
+    }
+
+    // 문장 i 의 원음 단어 시각을 재생 구간 시작 기준 ms 로 (파형 위 표시용). 캐시가 없으면 nullptr
+    const std::vector<Word>* origWordsFor(int i) {
+        const OrigWords* ow = origAbs(i);
+        if (!ow) return nullptr;
+        const int base = spanOf(i).startMs;
+        origRelScratch = ow->words;
+        for (auto& w : origRelScratch) { w.startMs -= base; w.endMs -= base; }
+        return &origRelScratch;
     }
 
     // 원음 파형 위에 단어 경계와 단어를 적는다 (채점 전에도). words 는 문장 시작 기준 ms
@@ -2755,9 +2849,8 @@ struct App {
         if (!mpv.paused()) togglePause();
         wordPlayer.stop();
         wordQueue.clear();
-        const auto& s = seg(current);
         try {
-            const int base = s.startMs - lastProsody.origPadMs;  // 원음 단어 시각은 앞에 여유를 붙인 클립 기준
+            const int base = lastProsody.segStartMs - lastProsody.origPadMs;  // 원음 단어 시각은 채점 구간 앞에 여유를 붙인 클립 기준
             auto orig = AudioEngine::loadWavSlice(video.audioPath, base + wp.origStartMs - 40, base + wp.origEndMs + 40, AudioEngine::kSampleRate);
             orig.resize(orig.size() + (size_t)AudioEngine::kSampleRate / 4, 0.0f);  // 250 ms 쉼
             if (!orig.empty()) wordQueue.push_back({std::move(orig), videoVolume / 100.0f});
@@ -3207,7 +3300,7 @@ struct App {
         const size_t totalBins = video.peaks.size() / 2;
         const bool curves = haveScore && scoreSeg == current && !scoring && !quizHidden() && lastProsody.have && valid(current);
         if (valid(current)) {
-            const auto& s = seg(current);
+            const Span s = spanOf(current);  // 자막 큐가 아니라 실제 말 구간 (whisper 로 잡았으면)
             size_t a = std::min(totalBins, (size_t)s.startMs / kPeakBinMs);
             size_t b = std::min(totalBins, (size_t)s.endMs / kPeakBinMs);
             float ph = (t * 1000 - s.startMs) / (float)(s.endMs - s.startMs);
@@ -3330,7 +3423,12 @@ struct App {
         else if (cmd == "dict") startDictLoad(!JaDict::installed());  // 일본어 사전 받기/로드
         else if (cmd == "ko") setShowKo(arg != "0");
         else if (cmd == "text") setShowText(arg != "0");
-        else if (cmd == "pos") fprintf(stderr, "[pos] t=%.3f current=%d start=%.3f playStart=%.3f mode=%d\n", mpv.timePos(), current, valid(current) ? seg(current).startMs / 1000.0 : -1.0, valid(current) ? playStartMs(current) / 1000.0 : -1.0, (int)mode);
+        else if (cmd == "pos") {
+            const Span sp = valid(current) ? spanOf(current) : Span{};
+            fprintf(stderr, "[pos] t=%.3f current=%d cue=%.3f..%.3f span=%.3f..%.3f playStart=%.3f mode=%d\n", mpv.timePos(), current,
+                    valid(current) ? seg(current).startMs / 1000.0 : -1.0, valid(current) ? seg(current).endMs / 1000.0 : -1.0,
+                    sp.startMs / 1000.0, sp.endMs / 1000.0, valid(current) ? playStartMs(current) / 1000.0 : -1.0, (int)mode);
+        }
         else if (cmd == "pron") { showPron = arg != "0"; db.setSetting("ja.showPron", showPron ? "1" : "0"); }
         else if (cmd == "word" && valid(current)) {  // word <k>: 현재 문장의 k 번째 단어를 클릭한 것처럼
             std::vector<std::string> ws; std::istringstream ws_(seg(current).text); for (std::string w; ws_ >> w;) ws.push_back(w);
