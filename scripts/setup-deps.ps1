@@ -58,13 +58,18 @@ if (-not (Test-Path "whisper.cpp\CMakeLists.txt")) {
 }
 
 # 6. libmpv (zhongfly/mpv-winbuild dev 패키지) + MSVC import lib 생성
+# 상류 릴리스는 한 달쯤 지나면 지워져서 (v0.6.1 CI 실패) 우리 저장소 릴리스(mpv-dev-20261009) 에 올려 둔 사본을 받는다.
+# 받기 · 풀기에 실패하면 바로 멈춘다 — 조용히 넘어가면 나중에 "mpv/client.h 없음" 으로 빌드가 깨진다.
 if (-not (Test-Path "mpv\libmpv.lib")) {
     Step "libmpv"
     New-Item -ItemType Directory -Force mpv | Out-Null
-    $mpvUrl = "https://github.com/zhongfly/mpv-winbuild/releases/download/2026-09-09-7e4cb538a3/mpv-dev-x86_64-20260909-git-7e4cb538a3.7z"
-    curl.exe -sL -o mpv-dev.7z $mpvUrl
+    $mpvUrl = "https://github.com/JuZeroKR/YouShadow/releases/download/mpv-dev-20261009/mpv-dev-x86_64-20261009-git-06ee185d3f.7z"
+    curl.exe -fsSL -o mpv-dev.7z $mpvUrl
+    if ($LASTEXITCODE -ne 0) { throw "libmpv 패키지를 받지 못했습니다: $mpvUrl" }
     & "$env:SystemRoot\System32\tar.exe" -xf mpv-dev.7z -C mpv
+    if ($LASTEXITCODE -ne 0) { throw "libmpv 패키지를 풀지 못했습니다 (7z 가 아닌 파일?)" }
     Remove-Item mpv-dev.7z
+    if (-not (Test-Path "mpv\include\mpv\client.h")) { throw "libmpv 패키지에 include/mpv/client.h 가 없습니다" }
 
     # libmpv-2.dll 의 export 목록으로 .def / .lib 를 만든다 (dumpbin, lib 는 VS 개발자 환경 필요)
     $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
