@@ -645,6 +645,7 @@ struct App {
     std::vector<int> readingPending;         // 작업 중에 들어온 요청
     bool showPron = true;                    // 자막 아래 한국어 발음 표시
     bool showKo = true;                      // 한국어 자막 표시 (내 영상 파일에 한국어 자막이 있을 때)
+    bool showText = true;                    // 원문 자막 표시. 끄면 영상 자막 · 문장 목록 · 단어 줄 · 파형 단어를 숨겨 소리만 듣고 따라 할 수 있다
     bool alignWave = true;                   // 내 녹음 파형 · 곡선을 원음 시간축에 맞춰 그린다 (늦게 시작하거나 느리게 말해도 나란히)
 
     // 문장 i 의 한국어 자막 (끄거나 없으면 빈 문자열)
@@ -656,6 +657,12 @@ struct App {
         showKo = on;
         db.setSetting("sub.showKo", on ? "1" : "0");
     }
+    void setShowText(bool on) {
+        showText = on;
+        db.setSetting("sub.showText", on ? "1" : "0");
+    }
+    // 원문을 숨겨야 하는가 (문장 학습 문제 진행 중이거나 [원문 자막] 을 껐을 때)
+    bool textHidden() const { return !showText || quizHidden(); }
 
     // 읽기 우선순위: AI 가 만든 것(DB) → 오프라인 사전 → 가나만 변환한 간이 읽기. AI 는 자동으로 부르지 않는다 (토큰 비용).
     const JaReading& readingFor(int i) {
@@ -928,6 +935,7 @@ struct App {
         uiLang = langFromCode(db.getSetting("ui.lang", "en"));
         showPron = db.getSetting("ja.showPron", "1") == "1";
         showKo = db.getSetting("sub.showKo", "1") == "1";
+        showText = db.getSetting("sub.showText", "1") == "1";
         alignWave = db.getSetting("wave.align", "1") == "1";
         snprintf(keyBuf[0], sizeof keyBuf[0], "%s", llm.claudeKey.c_str());
         snprintf(keyBuf[1], sizeof keyBuf[1], "%s", llm.openaiKey.c_str());
@@ -1860,31 +1868,34 @@ struct App {
                 }
             }
         }
-        // 자막 오버레이 (문장 학습 문제 중에는 정답이라 숨긴다)
+        // 자막 오버레이 (문장 학습 문제 중에는 정답이라 숨긴다. [원문 자막] 을 끄면 원문 · 발음은 숨기고 한국어 자막만 남긴다)
         if (valid(current) && !quizHidden()) {
             ImDrawList* dl = ImGui::GetWindowDrawList();
-            const std::string& text = seg(current).text;
+            const std::string text = showText ? seg(current).text : std::string();
             float wrap = avail.x * 0.9f;
             ImFont* font = ImGui::GetFont();
             float fsize = ImGui::GetFontSize() * 1.35f;
             // 일본어: 자막 아래에 한국어 발음을 한 줄 더 (읽지 못하는 한자가 있어도 따라 말할 수 있게)
             std::string pron;
-            if (video.lang == Lang::Ja && showPron) pron = readingFor(current).pronunciation;
+            if (video.lang == Lang::Ja && showPron && showText) pron = readingFor(current).pronunciation;
             // 한국어 자막은 그 아래 한 줄 더
             const std::string& ko = koFor(current);
-            const float psize = ImGui::GetFontSize() * 1.05f;
-            ImVec2 ts = font->CalcTextSizeA(fsize, FLT_MAX, wrap, text.c_str());
-            ImVec2 ps = pron.empty() ? ImVec2(0, 0) : font->CalcTextSizeA(psize, FLT_MAX, wrap, pron.c_str());
-            ImVec2 ks = ko.empty() ? ImVec2(0, 0) : font->CalcTextSizeA(psize, FLT_MAX, wrap, ko.c_str());
-            const float gap = pron.empty() ? 0.0f : 4.0f, kgap = ko.empty() ? 0.0f : 4.0f;
-            const float boxW = std::max({ts.x, ps.x, ks.x}), boxH = ts.y + gap + ps.y + kgap + ks.y;
-            ImVec2 pos(origin.x + (avail.x - boxW) / 2, origin.y + avail.y - boxH - 24);
-            dl->AddRectFilled(ImVec2(pos.x - 10, pos.y - 6), ImVec2(pos.x + boxW + 10, pos.y + boxH + 6), IM_COL32(0, 0, 0, 170), 6.0f);
-            dl->AddText(font, fsize, ImVec2(pos.x + (boxW - ts.x) / 2, pos.y), IM_COL32(255, 255, 255, 255), text.c_str(), nullptr, wrap);
-            if (!pron.empty())
-                dl->AddText(font, psize, ImVec2(pos.x + (boxW - ps.x) / 2, pos.y + ts.y + gap), IM_COL32(255, 230, 140, 255), pron.c_str(), nullptr, wrap);
-            if (!ko.empty())
-                dl->AddText(font, psize, ImVec2(pos.x + (boxW - ks.x) / 2, pos.y + ts.y + gap + ps.y + kgap), IM_COL32(170, 215, 255, 255), ko.c_str(), nullptr, wrap);
+            if (!text.empty() || !pron.empty() || !ko.empty()) {
+                const float psize = ImGui::GetFontSize() * 1.05f;
+                ImVec2 ts = text.empty() ? ImVec2(0, 0) : font->CalcTextSizeA(fsize, FLT_MAX, wrap, text.c_str());
+                ImVec2 ps = pron.empty() ? ImVec2(0, 0) : font->CalcTextSizeA(psize, FLT_MAX, wrap, pron.c_str());
+                ImVec2 ks = ko.empty() ? ImVec2(0, 0) : font->CalcTextSizeA(psize, FLT_MAX, wrap, ko.c_str());
+                const float gap = pron.empty() || text.empty() ? 0.0f : 4.0f, kgap = ko.empty() || (text.empty() && pron.empty()) ? 0.0f : 4.0f;
+                const float boxW = std::max({ts.x, ps.x, ks.x}), boxH = ts.y + gap + ps.y + kgap + ks.y;
+                ImVec2 pos(origin.x + (avail.x - boxW) / 2, origin.y + avail.y - boxH - 24);
+                dl->AddRectFilled(ImVec2(pos.x - 10, pos.y - 6), ImVec2(pos.x + boxW + 10, pos.y + boxH + 6), IM_COL32(0, 0, 0, 170), 6.0f);
+                if (!text.empty())
+                    dl->AddText(font, fsize, ImVec2(pos.x + (boxW - ts.x) / 2, pos.y), IM_COL32(255, 255, 255, 255), text.c_str(), nullptr, wrap);
+                if (!pron.empty())
+                    dl->AddText(font, psize, ImVec2(pos.x + (boxW - ps.x) / 2, pos.y + ts.y + gap), IM_COL32(255, 230, 140, 255), pron.c_str(), nullptr, wrap);
+                if (!ko.empty())
+                    dl->AddText(font, psize, ImVec2(pos.x + (boxW - ks.x) / 2, pos.y + ts.y + gap + ps.y + kgap), IM_COL32(170, 215, 255, 255), ko.c_str(), nullptr, wrap);
+            }
         }
         ImGui::EndChild();
     }
@@ -1922,13 +1933,15 @@ struct App {
             snprintf(label, sizeof label, "%s[%d] %s%s", bookmarks.count(i) ? "★ " : "", i, transcript::formatTime(s.startMs).c_str(), extra.c_str());
 
             const float wrap = ImGui::GetContentRegionAvail().x - 8;
-            ImVec2 textSize = ImGui::CalcTextSize(s.text.c_str(), nullptr, false, wrap);
+            // 학습 문제 진행 중인 문장은 정답이라 통째로, [원문 자막] 을 끄면 원문 · 발음만 숨긴다 (한국어 자막은 그대로)
+            const bool rowQuiz = i == quizSeg && valid(quizSeg) && !quizRevealed;
+            const char* rowText = rowQuiz ? "(학습 문제 진행 중 — 정답 공개 전까지 숨김)" : showText ? s.text.c_str() : "(원문 숨김 — 소리만 듣고 따라 말하기)";
+            ImVec2 textSize = ImGui::CalcTextSize(rowText, nullptr, false, wrap);
             // 일본어: AI 읽기가 있으면 한국어 발음을 한 줄 더 보여 준다
             const JaReading* rowRead = nullptr;
-            if (video.lang == Lang::Ja && showPron && (jaReady || readings.count(i))) { const JaReading& rr = readingFor(i); if (!rr.pronunciation.empty()) rowRead = &rr; }
+            if (video.lang == Lang::Ja && showPron && showText && !rowQuiz && (jaReady || readings.count(i))) { const JaReading& rr = readingFor(i); if (!rr.pronunciation.empty()) rowRead = &rr; }
             ImVec2 pronSize = rowRead ? ImGui::CalcTextSize(rowRead->pronunciation.c_str(), nullptr, false, wrap) : ImVec2(0, 0);
-            const bool rowHidden = i == quizSeg && valid(quizSeg) && !quizRevealed;
-            const std::string& rowKo = rowHidden ? std::string() : koFor(i);
+            const std::string& rowKo = rowQuiz ? std::string() : koFor(i);
             ImVec2 koSize = rowKo.empty() ? ImVec2(0, 0) : ImGui::CalcTextSize(rowKo.c_str(), nullptr, false, wrap);
             float h = ImGui::GetTextLineHeight() + textSize.y + pronSize.y + koSize.y + 6;
             bool selected = (i == current);
@@ -1942,9 +1955,9 @@ struct App {
             ImU32 labelCol = bookmarks.count(i) ? IM_COL32(255, 200, 80, 255) : ImGui::GetColorU32(ImGuiCol_TextDisabled);
             dl->AddText(font, fs, ImVec2(top.x + 4, top.y + 2), labelCol, label);
             ImU32 col = selected ? IM_COL32(255, 230, 100, 255) : ImGui::GetColorU32(ImGuiCol_Text);
-            const char* rowText = (i == quizSeg && valid(quizSeg) && !quizRevealed) ? "(학습 문제 진행 중 — 정답 공개 전까지 숨김)" : s.text.c_str();
+            if (rowQuiz || !showText) col = ImGui::GetColorU32(ImGuiCol_TextDisabled);
             dl->AddText(font, fs, ImVec2(top.x + 4, top.y + 2 + ImGui::GetTextLineHeight()), col, rowText, nullptr, wrap);
-            if (rowRead && !(i == quizSeg && valid(quizSeg) && !quizRevealed))
+            if (rowRead)
                 dl->AddText(font, fs, ImVec2(top.x + 4, top.y + 2 + ImGui::GetTextLineHeight() + textSize.y), IM_COL32(255, 230, 140, 200), rowRead->pronunciation.c_str(), nullptr, wrap);
             if (!rowKo.empty())
                 dl->AddText(font, fs, ImVec2(top.x + 4, top.y + 2 + ImGui::GetTextLineHeight() + textSize.y + pronSize.y), IM_COL32(170, 215, 255, 200), rowKo.c_str(), nullptr, wrap);
@@ -2532,11 +2545,21 @@ struct App {
             if (ImGui::IsItemHovered()) ImGui::SetTooltip("끄면 한자를 직접 읽는 연습을 할 수 있습니다. 단어를 클릭하면 팝업에서는 읽기와 발음을 볼 수 있습니다.");
             ImGui::SameLine();
         }
+        {
+            bool on = showText;
+            if (ImGui::Checkbox("원문 자막 (H)", &on)) setShowText(on);
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip("끄면 영상 자막 · 문장 목록 · 단어 줄 · 파형의 원문을 모두 숨깁니다.\n소리만 듣고 따라 말하는 연습을 할 수 있습니다. 채점 결과와 해설은 그대로 보입니다.");
+            ImGui::SameLine();
+        }
         if (!video.ko.empty()) {
             bool on = showKo;
             if (ImGui::Checkbox("한국어 자막 (K)", &on)) setShowKo(on);
             if (ImGui::IsItemHovered()) ImGui::SetTooltip("영상 자막 아래와 문장 목록에 한국어 자막을 보여 줍니다.\n끄면 뜻을 보지 않고 듣고 따라 하는 연습을 할 수 있습니다.");
             ImGui::SameLine();
+        }
+        if (!showText) {
+            ImGui::TextDisabled("원문을 숨겼습니다. 소리만 듣고 따라 말해 보세요 (다시 보려면 [원문 자막] 켜기 또는 H)");
+            return;
         }
         ImGui::TextDisabled("단어 클릭: 발음과 뜻  |  드래그: 복사  |  아래 파형 클릭: 그 지점부터 다시 듣기");
 
@@ -3033,7 +3056,7 @@ struct App {
         for (const auto& v : library) practicedTotal += v.practicedSegs;
         ImGui::Text("영상 %d개   연습한 문장 %d개   총 연습 %d회", (int)library.size(), practicedTotal, totalCount);
         ImGui::Spacing();
-        ImGui::TextDisabled("단축키: Space 재생/정지, ← → 문장 이동, S 쉐도잉, E 따라말하기, T 녹음, B 북마크, P 읽기·발음 숨기기(일본어)");
+        ImGui::TextDisabled("단축키: Space 재생/정지, ← → 문장 이동, S 쉐도잉, E 따라말하기, T 녹음, B 북마크, H 원문 자막 숨기기, K 한국어 자막, P 읽기·발음 숨기기(일본어)");
         ImGui::EndChild();
     }
 
@@ -3176,7 +3199,7 @@ struct App {
             drawWaveform(video.peaks.data() + 2 * a, b - a, ImVec2(w, h), IM_COL32(90, 170, 255, 255), mpv.paused() ? -1.0f : ph);
             const float segDur = (float)(s.endMs - s.startMs);
             // 단어 경계 · 단어: 채점 뒤에는 채점 결과의 단어 쌍을, 그 전에는 원음 단어 시각 캐시(없으면 뒤에서 인식)를 쓴다
-            const std::vector<Word>* ow = quizHidden() ? nullptr : origWordsFor(current);
+            const std::vector<Word>* ow = textHidden() ? nullptr : origWordsFor(current);
             if (curves) {
                 drawWordTicks(rectPos, ImVec2(w, h), segDur, false);
                 drawPitchCurve(rectPos, ImVec2(w, h), lastProsody.orig.semitone, nullptr, segDur, IM_COL32(255, 210, 80, 230), (float)lastProsody.origPadMs);
@@ -3261,6 +3284,7 @@ struct App {
         if (ImGui::IsKeyPressed(ImGuiKey_T, false) && valid(current) && !recording()) startRecordOnly(current);
         if (ImGui::IsKeyPressed(ImGuiKey_B, false) && valid(current)) toggleBookmark(current);
         if (ImGui::IsKeyPressed(ImGuiKey_K, false) && !video.ko.empty()) setShowKo(!showKo);
+        if (ImGui::IsKeyPressed(ImGuiKey_H, false)) setShowText(!showText);
         if (ImGui::IsKeyPressed(ImGuiKey_P, false) && loaded && video.lang == Lang::Ja) { showPron = !showPron; db.setSetting("ja.showPron", showPron ? "1" : "0"); }
     }
 
@@ -3289,6 +3313,7 @@ struct App {
         else if (cmd == "lang") setUiLang(langFromCode(arg));
         else if (cmd == "dict") startDictLoad(!JaDict::installed());  // 일본어 사전 받기/로드
         else if (cmd == "ko") setShowKo(arg != "0");
+        else if (cmd == "text") setShowText(arg != "0");
         else if (cmd == "pron") { showPron = arg != "0"; db.setSetting("ja.showPron", showPron ? "1" : "0"); }
         else if (cmd == "word" && valid(current)) {  // word <k>: 현재 문장의 k 번째 단어를 클릭한 것처럼
             std::vector<std::string> ws; std::istringstream ws_(seg(current).text); for (std::string w; ws_ >> w;) ws.push_back(w);
