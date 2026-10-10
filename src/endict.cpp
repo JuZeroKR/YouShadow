@@ -1,6 +1,7 @@
 #include "endict.h"
 
 #include <cctype>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 
@@ -93,6 +94,19 @@ EnEntry EnDict::make(const std::string& key, const Lemma& l) const {
         if (!s.korean.empty() || !s.english.empty()) e.senses.push_back(std::move(s));
     }
     return e;
+}
+
+bool EnDict::isKnownWord(const std::string& word) const {
+    const std::string key = lowerKey(word);
+    if (key.empty()) return false;
+    if (find(key) || forms_.count(key)) return true;
+    for (const char* suf : {"n't", "'s", "'re", "'ll", "'ve", "'d", "'m"}) {
+        if (!endsWith(key, suf)) continue;
+        std::string base = key.substr(0, key.size() - std::strlen(suf));
+        if (base == "wo") base = "will"; else if (base == "ca") base = "can"; else if (base == "sha") base = "shall";
+        return !base.empty() && (find(base) || forms_.count(base));
+    }
+    return false;
 }
 
 EnEntry EnDict::lookup(const std::string& word) const {

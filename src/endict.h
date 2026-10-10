@@ -33,6 +33,10 @@ public:
     // 문장에 나온 단어로 찾는다: 그대로 → 변화형(got → get) → 규칙(-s, -ed, -ing …) → 축약형(doesn't → does).
     EnEntry lookup(const std::string& word) const;
 
+    // 표제어이거나 변화형 표에 있는 단어인가 (축약형은 n't/'s/'re… 를 뗀 바탕으로). lookup 과 달리 -s/-ed/-ing 규칙 추측은 쓰지 않아
+    // "goand", "equipmentd" 같은 엉뚱한 조각을 단어로 치지 않는다. 자막의 붙은 단어를 나눌 때 쓴다.
+    bool isKnownWord(const std::string& word) const;
+
 private:
     struct Lemma {
         std::string ipa;

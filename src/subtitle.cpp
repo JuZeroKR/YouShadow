@@ -526,6 +526,117 @@ std::vector<Segment> cuesToLines(const std::vector<Cue>& cues) {
     return segs;
 }
 
+namespace {
+
+// 붙은 자리에 흔히 오는 짧은 단어(기능어 · 아주 흔한 말). 사전에는 "lo", "caf", "eau" 같은 희귀어도 있어서 사전에 있다는 것만으로는
+// "longas" 를 "lo ngas" 로, 이름 "caffrey" 를 "caf frey" 로 잘못 나눌 수 있다. 3글자 이하 조각은 이 목록에 있어야 하고, 목록 단어가 든 후보에 점수를 더 준다
+bool isCommonWord(const std::string& w) {
+    static const char* const kWords[] = {
+        "a", "i", "ah", "am", "an", "as", "at", "be", "by", "do", "go", "he", "if", "in", "is", "it", "me", "my", "no", "of", "oh",
+        "ok", "on", "or", "so", "to", "up", "us", "we", "all", "and", "any", "are", "ask", "bad", "big", "boy", "but", "buy", "can",
+        "car", "day", "did", "end", "far", "few", "for", "get", "god", "got", "guy", "had", "has", "her", "hey", "him", "his", "how",
+        "its", "job", "let", "lot", "man", "men", "new", "not", "now", "off", "old", "one", "our", "out", "put", "run",
+        "saw", "say", "see", "she", "sit", "the", "too", "try", "two", "use", "was", "way", "who", "why", "yes", "yet", "you",
+        "back", "been", "come", "does", "down", "else", "even", "ever", "from", "good", "have", "here", "into", "just", "know",
+        "last", "like", "long", "look", "many", "more", "most", "much", "must", "need", "next", "once", "only", "onto", "over",
+        "same", "some", "soon", "such", "take", "tell", "than", "that", "them", "then", "they", "this", "till", "time",
+        "upon", "used", "very", "want", "well", "went", "were", "what", "when", "will", "with", "your",
+        "about", "after", "again", "apart", "away", "could", "every", "first", "going", "never", "other", "right", "shall",
+        "since", "still", "their", "there", "these", "thing", "think", "those", "under", "until", "where", "which", "while",
+        "would", "always", "around", "before", "really", "should", "though", "because", "through", "whenever"};
+    for (const char* k : kWords) if (w == k) return true;
+    return false;
+}
+
+// 흔한 단어이거나 흔한 단어의 축약형인가 ("it's", "don't", "you're" 는 참, "kin's" 는 거짓)
+bool isCommonish(const std::string& p) {
+    if (isCommonWord(p)) return true;
+    const size_t q = p.find('\'');
+    if (q == std::string::npos) return false;
+    std::string base = p.substr(0, q);
+    if (p.compare(q, std::string::npos, "'t") == 0 && !base.empty() && base.back() == 'n') base.pop_back();  // don't → do
+    return isCommonWord(base);
+}
+
+// 축약 조각은 끝이 축약 어미여야 한다 ("wasn't" 는 되고 "wasn'ts" 는 안 된다). 아포스트로피가 없으면 참
+bool apostropheOk(const std::string& p) {
+    const size_t q = p.find('\'');
+    if (q == std::string::npos) return true;
+    if (p.find('\'', q + 1) != std::string::npos || q == 0) return false;
+    const std::string suf = p.substr(q);
+    return (suf == "'s" || suf == "'re" || suf == "'ll" || suf == "'ve" || suf == "'d" || suf == "'m" || (suf == "'t" && q >= 2 && p[q - 1] == 'n'));
+}
+
+// 붙은 토큰 하나를 나눈다. core 는 아포스트로피를 포함한 ASCII 소문자뿐. 못 나누면 빈 문자열.
+// 후보가 여럿이면 긴 조각이 더 길고 흔한 단어가 든 것을 고른다 ("longas" → "long|as", "warehousedown" → "warehouse|down").
+// 점수가 낮은 후보(짧은 조각 둘, 흔한 단어 없음: "gins|berg", "web|page")는 이름이나 사전에 없는 합성어일 수 있어 두지 않는다.
+std::string splitCore(const std::string& core, const std::function<bool(const std::string&)>& isWord) {
+    auto ok = [&](const std::string& part) {
+        if (isCommonWord(part)) return true;  // 사전에 빠진 기능어("am")도 있다
+        if (part.size() <= 3) return false;
+        if (!apostropheOk(part)) return false;
+        return isWord(part);
+    };
+    std::string best;
+    int bestScore = -1;
+    const bool shortTok = core.size() < 6;  // 5글자 이하는 두 조각이 모두 흔한 단어일 때만 ("lotof", "youat", "upmy")
+    for (size_t i = 1; i < core.size(); ++i) {
+        const std::string p1 = core.substr(0, i), p2 = core.substr(i);
+        if (!ok(p1) || !ok(p2)) continue;
+        // 흔한 단어 또는 흔한 단어의 축약형("don't", "that's") 이 든 후보에 점수를 더 준다 (붙은 자리에는 대개 이런 말이 온다).
+        // 소유격 이름("kin's") 은 흔한 말이 아니므로 점수를 주지 않는다 → "pushkin's" 가 "push kin's" 로 갈라지지 않는다
+        const bool c1 = isCommonish(p1), c2 = isCommonish(p2);
+        // 한 글자 조각("a", "i")은 상대가 흔한 단어일 때만 ("alwaysa" → "always a" 는 되고 "agoand" → "a goand" 는 안 된다)
+        if ((p1.size() == 1 && !c2) || (p2.size() == 1 && !c1)) continue;
+        int score = (int)std::max(p1.size(), p2.size()) * 4 + (int)std::min(p1.size(), p2.size());
+        if (c2) score += 12;
+        if (c1) score += 10;
+        // 5글자 이하는 두 조각이 모두 흔한 단어일 때만 ("lotof", "youat", "upmy") — 그때는 점수 문턱도 보지 않는다
+        if (shortTok) { if (!(c1 && c2)) continue; score += 100; }
+        if (score > bestScore) { bestScore = score; best = p1 + " " + p2; }
+    }
+    // 흔한 단어가 없는 짧은 조각 둘("gins|berg" 20, "road|blocks" 28, "web|page" 19)은 이름이나 사전에 없는 합성어일 수 있어 두지 않는다.
+    // 4+2 ("bond|at" 30), 5+5 축약형 ("don't|shake" 35), 3+4 ("you|find" 29) 는 된다
+    return bestScore >= 29 ? best : "";
+}
+
+}  // namespace
+
+std::string splitGlued(const std::string& text, const std::function<bool(const std::string&)>& isWord) {
+    if (!isWord) return text;
+    std::string out;
+    std::istringstream ss(text);
+    std::string tok;
+    bool first = true;
+    while (ss >> tok) {
+        if (!first) out += ' ';
+        // 둥근 아포스트로피(’)는 곧은 것으로 (사전 키와 맞춘다)
+        for (size_t p; (p = tok.find("\xE2\x80\x99")) != std::string::npos;) tok.replace(p, 3, "'");
+        // 앞뒤 문장 부호를 떼고 가운데(core)만 본다
+        size_t b = 0, e = tok.size();
+        while (b < e && !std::isalpha((unsigned char)tok[b])) ++b;
+        while (e > b && !std::isalpha((unsigned char)tok[e - 1])) --e;
+        const std::string core = tok.substr(b, e - b);
+        bool plain = core.size() >= 4;
+        for (char c : core) if (!isAsciiAlpha(c) && c != '\'') { plain = false; break; }
+        if (e < tok.size() && tok[e] == '\'') plain = false;  // "freakin'" 처럼 g 를 뺀 말투는 그대로 둔다
+        // 문장 중간의 대문자 토큰은 이름일 수 있어 두지 않는다 (문장 첫 토큰은 대문자가 정상)
+        if (plain && !first && std::isupper((unsigned char)core[0])) plain = false;
+        std::string lowered = lower(core);
+        if (plain && !isWord(lowered)) {
+            std::string split = splitCore(lowered, isWord);
+            if (!split.empty()) {
+                // 원래 대소문자 유지: 나눈 자리에만 공백을 넣는다
+                const size_t cut = split.find(' ');
+                tok = tok.substr(0, b) + core.substr(0, cut) + " " + core.substr(cut) + tok.substr(e);
+            }
+        }
+        out += tok;
+        first = false;
+    }
+    return out;
+}
+
 std::vector<std::string> alignLines(const std::vector<Segment>& segs, const std::vector<Cue>& other) {
     std::vector<std::string> out(segs.size());
     if (segs.empty()) return out;

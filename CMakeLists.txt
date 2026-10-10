@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(YouShadow VERSION 0.6.0 LANGUAGES C CXX)
+project(YouShadow VERSION 0.6.1 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -133,6 +133,9 @@ target_link_libraries(ja_test PRIVATE ys_core)
 # 억양 · 리듬 · 강세 비교 검증 도구 (합성 신호 자체 테스트 + 실제 녹음 비교)
 add_executable(prosody_test src/prosody_test.cpp)
 target_link_libraries(prosody_test PRIVATE ys_core)
+# 자막 붙은 단어 떼기 검증 도구 (자체 테스트 + segments.json 미리보기)
+add_executable(subtitle_test src/subtitle_test.cpp)
+target_link_libraries(subtitle_test PRIVATE ys_core)
 
 # 일본어 오프라인 사전 팩 빌드 도구 (개발용, 배포본에는 들어가지 않는다)
 add_executable(ja_dict_build tools/ja_dict_build.cpp)

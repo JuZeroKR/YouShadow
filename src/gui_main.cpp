@@ -74,6 +74,7 @@ struct Loader {
     bool busy = false, done = false, ok = false;
     LoadedVideo result;
     Stt* stt = nullptr;
+    std::function<bool(const std::string&)> isWord;  // 영어 사전 (붙은 단어 떼기용). 사전이 아직 없으면 비어 있다
 
     void setStatus(const std::string& s) {
         std::lock_guard<std::mutex> lock(m);
@@ -95,7 +96,7 @@ struct Loader {
         const std::string lv = localVideo, ls = localSub;
         localVideo.clear();
         localSub.clear();
-        th = std::thread([this, id, lang, isLocal, lv, ls] {
+        th = std::thread([this, id, lang, isLocal, lv, ls, isWord = isWord] {
             LoadedVideo v;
             std::string err;
             try {
@@ -121,7 +122,9 @@ struct Loader {
 
                 const std::string segPath = v.dir + "/segments.json";
                 v.segs = transcript::load(segPath);
+                bool dirty = false;
                 if (v.segs.empty()) {
+                    dirty = true;
                     if (!subtitlePath.empty()) {
                         // 자막 파일은 장면(대사) 단위가 이미 깔끔하므로 그대로 문장으로 쓴다
                         v.segs = json3 ? transcript::parseJson3(subtitlePath, lang)
@@ -145,8 +148,15 @@ struct Loader {
                         v.segs = transcript::splitWords(std::move(words), lang);
                         if (v.segs.empty()) throw std::runtime_error("음성에서 문장을 찾지 못했습니다");
                     }
-                    transcript::save(v.segs, segPath);
                 }
+                // 자막 제작 실수로 붙은 단어("beenafter") 떼기. 사전이 있을 때만, 이미 저장한 문장도 한 번 고쳐 다시 저장한다
+                if (lang == Lang::En && isWord) {
+                    for (auto& s : v.segs) {
+                        std::string t = subtitle::splitGlued(s.text, isWord);
+                        if (t != s.text) { s.text = std::move(t); dirty = true; }
+                    }
+                }
+                if (dirty) transcript::save(v.segs, segPath);
                 if (isLocal) {
                     setStatus("한국어 자막 찾는 중...");
                     auto ko = local::koreanCues(v.videoPath, v.dir);
@@ -317,6 +327,38 @@ struct ScoreJob {
     ~ScoreJob() { if (th.joinable()) th.join(); }
 };
 
+// 원음 문장의 단어 시각만 인식한다 (파형 위에 단어를 적기 위해). 채점 때와 같은 넓힌 클립 · 같은 JSON 이라 결과는 같은 DB 캐시에 들어간다
+struct OrigWordsJob {
+    std::thread th;
+    std::mutex m;
+    bool running = false, done = false;
+    std::string videoId;
+    int segIdx = -1;
+    std::string jsonOut;  // 비어 있으면 실패
+
+    void start(Stt* stt, std::string audioPath, int segStart, int segEnd, Lang lang, std::string vid, int seg) {
+        if (th.joinable()) th.join();
+        {
+            std::lock_guard<std::mutex> lock(m);
+            running = true; done = false; videoId = std::move(vid); segIdx = seg; jsonOut.clear();
+        }
+        th = std::thread([this, stt, audioPath, segStart, segEnd, lang] {
+            std::string json;
+            try {
+                const int pad = lang == Lang::Ja ? 0 : ScoreJob::kOrigPadMs;
+                auto pcm = AudioEngine::loadWavSlice(audioPath, segStart - std::min(pad, segStart), segEnd + pad, Stt::kRate);
+                std::string e;
+                auto words = stt->transcribe(pcm, {}, &e);
+                if (e.empty() && !words.empty()) json = prosody::wordsToJson(words);
+            } catch (const std::exception&) {}
+            std::lock_guard<std::mutex> lock(m);
+            jsonOut = std::move(json);
+            done = true;
+        });
+    }
+    ~OrigWordsJob() { if (th.joinable()) th.join(); }
+};
+
 // ---------------- 앱 상태 ----------------
 
 enum class Mode { Idle, Segment, Shadow, ShadowTail, EchoListen, EchoRecord, EchoCompareOrig, EchoCompareMine, Record, MyRec };
@@ -435,6 +477,10 @@ struct App {
     SttLoader& sttLoaderFor(Lang l) { return l == Lang::Ja ? sttLoaderJa : sttLoaderEn; }
     Stt& sttCur() { return sttFor(curLang()); }
     ScoreJob scoreJob;
+    OrigWordsJob origWordsJob;
+    // 문장 번호 → 원음 단어 (기준 문장과 맞는 것만, 문장 시작 기준 ms). 영상을 열 때 비운다
+    std::map<int, std::vector<Word>> origWordsCache;
+    std::set<int> origWordsTried;  // 인식을 시도한 문장 (실패해도 다시 돌리지 않는다)
 
     LoadedVideo video;
     bool loaded = false;
@@ -450,6 +496,7 @@ struct App {
     int current = -1;
     int loopsSetting = 1;
     int loopsLeft = 0;
+    int loopStartMs = -1;  // 반복할 때 되돌아갈 시각 (파형을 클릭해 중간부터 들을 때 그 지점, 아니면 문장 시작)
     float speed = 1.0f;
     bool stopAtEnd = true;
     Clock::time_point seekGrace;
@@ -1082,12 +1129,14 @@ struct App {
     }
 
     // ---- 동작 ----
-    void playSegment(int i, int loops) {
+    // fromMs 가 있으면 그 시각부터 문장 끝까지 (반복 때도 거기로 돌아간다)
+    void playSegment(int i, int loops, int fromMs = -1) {
         if (!valid(i)) return;
         stopAll();
         current = i;
         loopsLeft = std::max(1, loops);
-        seekTo(seg(i).startMs / 1000.0);
+        loopStartMs = fromMs >= 0 ? fromMs : seg(i).startMs;
+        seekTo(loopStartMs / 1000.0);
         mpv.setPaused(false);
         // "문장 끝에서 정지" 를 끈 상태면 그 위치부터 자유 재생 (목록은 시간에 따라 따라감)
         mode = stopAtEnd ? Mode::Segment : Mode::Idle;
@@ -1257,7 +1306,7 @@ struct App {
             case Mode::Segment:
                 if (pastSegmentEnd(t)) {
                     if (--loopsLeft > 0) {
-                        seekTo(seg(current).startMs / 1000.0);
+                        seekTo(loopStartMs / 1000.0);
                     } else {
                         mpv.setPaused(true);
                         mode = Mode::Idle;
@@ -1446,7 +1495,10 @@ struct App {
                     }
                     // 원음 단어 시각을 새로 인식했으면 캐시한다 (그 사이 다른 영상을 열었으면 버린다)
                     const bool sameVideo = loaded && scoreJob.videoId == video.id;
-                    if (scoreJob.origWordsFresh && sameVideo && valid(scoreJob.segIdx)) db.setSegWords(video.id, scoreJob.segIdx, scoreJob.origWordsJsonOut);
+                    if (scoreJob.origWordsFresh && sameVideo && valid(scoreJob.segIdx)) {
+                        db.setSegWords(video.id, scoreJob.segIdx, scoreJob.origWordsJsonOut);
+                        origWordsCache.erase(scoreJob.segIdx);  // 다음 프레임에 DB 에서 다시 읽는다
+                    }
                     // 화면에는 지금 보고 있는 영상 · 문장의 결과일 때만 반영한다
                     if (sameVideo && scoreJob.segIdx == scoreSeg) {
                         lastScore = scoreJob.result;
@@ -1463,6 +1515,64 @@ struct App {
                 }
             }
         }
+        // 원음 단어 시각 (파형 단어 표시용) 수거
+        {
+            std::lock_guard<std::mutex> lock(origWordsJob.m);
+            if (origWordsJob.done) {
+                origWordsJob.done = false;
+                origWordsJob.running = false;
+                if (!origWordsJob.jsonOut.empty() && loaded && origWordsJob.videoId == video.id && valid(origWordsJob.segIdx)) {
+                    db.setSegWords(video.id, origWordsJob.segIdx, origWordsJob.jsonOut);
+                    origWordsCache.erase(origWordsJob.segIdx);
+                }
+            }
+        }
+    }
+
+    // 문장 i 의 원음 단어 시각 (문장 시작 기준 ms, 기준 문장과 맞는 단어만). DB 캐시가 없으면 STT 로 한 번 인식을 걸어 두고 nullptr
+    const std::vector<Word>* origWordsFor(int i) {
+        if (!loaded || !valid(i)) return nullptr;
+        if (auto it = origWordsCache.find(i); it != origWordsCache.end()) return &it->second;
+        const auto& s = seg(i);
+        const std::string json = db.getSegWords(video.id, i);
+        if (json.empty()) {
+            bool busy; { std::lock_guard<std::mutex> lock(origWordsJob.m); busy = origWordsJob.running; }
+            if (!busy && !scoring && sttCur().loaded() && !origWordsTried.count(i) && !video.audioPath.empty()) {
+                origWordsTried.insert(i);
+                origWordsJob.start(&sttCur(), video.audioPath, s.startMs, s.endMs, video.lang, video.id, i);
+            }
+            return nullptr;
+        }
+        // 캐시는 앞에 여유를 붙인 클립 기준 시각이다. 이웃 대사의 단어는 빼고 문장 시작 기준으로 옮긴다
+        std::vector<Word> all = prosody::wordsFromJson(json), out;
+        const int padFront = std::min(video.lang == Lang::Ja ? 0 : ScoreJob::kOrigPadMs, s.startMs);
+        if (video.lang != Lang::Ja) {
+            std::vector<std::string> texts;
+            for (const auto& w : all) texts.push_back(w.text);
+            std::vector<char> used(all.size(), 0);
+            for (int j : alignTokens(s.text, texts, video.lang)) if (j >= 0) used[j] = 1;
+            for (size_t k = 0; k < all.size(); ++k) if (used[k]) out.push_back(all[k]);
+        } else {
+            out = all;
+        }
+        for (auto& w : out) { w.startMs -= padFront; w.endMs -= padFront; }
+        return &(origWordsCache[i] = std::move(out));
+    }
+
+    // 원음 파형 위에 단어 경계와 단어를 적는다 (채점 전에도). words 는 문장 시작 기준 ms
+    void drawOrigWordLabels(ImVec2 pos, ImVec2 size, float durationMs, const std::vector<Word>& words) {
+        if (durationMs <= 0 || size.x <= 0) return;
+        ImDrawList* dl = ImGui::GetWindowDrawList();
+        dl->PushClipRect(pos, ImVec2(pos.x + size.x, pos.y + size.y), true);
+        ImFont* font = ImGui::GetFont();
+        const float fs = 13.0f * uiScale;
+        for (const auto& w : words) {
+            const float x0 = pos.x + w.startMs / durationMs * size.x, x1 = pos.x + w.endMs / durationMs * size.x;
+            dl->AddLine(ImVec2(x0, pos.y), ImVec2(x0, pos.y + size.y), IM_COL32(255, 255, 255, 50), 1.0f);
+            const float tw = font->CalcTextSizeA(fs, FLT_MAX, 0.0f, w.text.c_str()).x;
+            if (x1 - x0 > tw + 4) dl->AddText(font, fs, ImVec2(x0 + 2, pos.y + 2), IM_COL32(255, 255, 255, 170), w.text.c_str());
+        }
+        dl->PopClipRect();
     }
 
     void onLoaded(LoadedVideo&& v) {
@@ -1470,6 +1580,8 @@ struct App {
         video = std::move(v);
         loaded = true;
         current = -1;
+        origWordsCache.clear();
+        origWordsTried.clear();
         myRec.clear();
         myRecPeaks.clear();
         haveScore = false;
@@ -1526,6 +1638,9 @@ struct App {
 
     void startLoad(const std::string& id, Lang lang) {
         loader.stt = &sttFor(lang);
+        // 영어 사전이 준비돼 있으면 붙은 단어를 떼는 데 쓴다 (사전은 시작할 때 한 번 로드되고 그 뒤로는 읽기만 한다)
+        if (enReady) loader.isWord = [this](const std::string& w) { return enDict.isKnownWord(w); };
+        else loader.isWord = nullptr;
         loader.start(id, lang);
     }
 
@@ -2423,7 +2538,7 @@ struct App {
             if (ImGui::IsItemHovered()) ImGui::SetTooltip("영상 자막 아래와 문장 목록에 한국어 자막을 보여 줍니다.\n끄면 뜻을 보지 않고 듣고 따라 하는 연습을 할 수 있습니다.");
             ImGui::SameLine();
         }
-        ImGui::TextDisabled("단어 클릭: 발음과 뜻  |  드래그: 복사");
+        ImGui::TextDisabled("단어 클릭: 발음과 뜻  |  드래그: 복사  |  아래 파형 클릭: 그 지점부터 다시 듣기");
 
         // 영어: 띄어쓰기 단위. 일본어: AI(또는 간이) 토큰 단위, 버튼 아래 줄에 한국어 발음.
         const bool ja = video.lang == Lang::Ja;
@@ -3059,10 +3174,26 @@ struct App {
             float ph = (t * 1000 - s.startMs) / (float)(s.endMs - s.startMs);
             const ImVec2 rectPos = ImGui::GetCursorScreenPos();
             drawWaveform(video.peaks.data() + 2 * a, b - a, ImVec2(w, h), IM_COL32(90, 170, 255, 255), mpv.paused() ? -1.0f : ph);
+            const float segDur = (float)(s.endMs - s.startMs);
+            // 단어 경계 · 단어: 채점 뒤에는 채점 결과의 단어 쌍을, 그 전에는 원음 단어 시각 캐시(없으면 뒤에서 인식)를 쓴다
+            const std::vector<Word>* ow = quizHidden() ? nullptr : origWordsFor(current);
             if (curves) {
-                const float segDur = (float)(s.endMs - s.startMs);
                 drawWordTicks(rectPos, ImVec2(w, h), segDur, false);
                 drawPitchCurve(rectPos, ImVec2(w, h), lastProsody.orig.semitone, nullptr, segDur, IM_COL32(255, 210, 80, 230), (float)lastProsody.origPadMs);
+            } else if (ow) {
+                drawOrigWordLabels(rectPos, ImVec2(w, h), segDur, *ow);
+            }
+            // 원음 파형 클릭: 그 지점부터 문장 끝까지 다시 듣는다 (긴 문장을 중간부터 따라잡을 때). 마우스를 올리면 안내선과 시각 · 단어
+            if (ImGui::IsItemHovered() && !recording()) {
+                const float fx = std::clamp((ImGui::GetMousePos().x - rectPos.x) / std::max(w, 1.0f), 0.0f, 1.0f);
+                const int ms = s.startMs + (int)(fx * segDur);
+                const float x = rectPos.x + fx * w;
+                ImGui::GetWindowDrawList()->AddLine(ImVec2(x, rectPos.y), ImVec2(x, rectPos.y + h), IM_COL32(255, 255, 255, 140), 1.0f);
+                const Word* under = nullptr;
+                if (ow) for (const auto& wd : *ow) if (ms - s.startMs >= wd.startMs && ms - s.startMs < wd.endMs) { under = &wd; break; }
+                if (under) ImGui::SetTooltip("'%s'  %s 부터 다시 듣기", under->text.c_str(), transcript::formatTime(ms).c_str());
+                else ImGui::SetTooltip("%s 부터 다시 듣기", transcript::formatTime(ms).c_str());
+                if (ImGui::IsMouseClicked(ImGuiMouseButton_Left)) playSegment(current, loopsSetting, ms);
             }
         } else {
             drawWaveform(nullptr, 0, ImVec2(w, h), 0, -1.0f);

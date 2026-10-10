@@ -1,4 +1,5 @@
 #pragma once
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -31,6 +32,12 @@ std::vector<Cue> parseCues(const std::string& path, Lang lang);
 // 장면을 대사 단위 문장으로: "- A - B" 처럼 두 사람 대사가 한 장면에 있으면 나누고(시간은 글자 수 비례),
 // 앞의 "- " 를 떼고, "year,it's" / "shot.Come" 처럼 붙은 문장 부호 뒤를 띄운다.
 std::vector<Segment> cuesToLines(const std::vector<Cue>& cues);
+
+// 자막 제작 실수로 붙은 두 단어를 뗀다: "beenafter" → "been after", "you'reout," → "you're out,".
+// isWord(소문자 단어) 는 사전의 표제어 · 변화형인지 (EnDict::isKnownWord). 사전에 없는 토큰을, 두 조각이 모두 사전에 있고
+// 흔한 단어가 들어 있거나 조각이 충분히 길 때만 나눈다. 3글자 이하 조각은 흔한 단어여야 하고(이름 "caffrey" → "caf frey" 방지),
+// 문장 중간의 대문자 토큰(이름)과 하이픈 · 숫자가 든 토큰은 건드리지 않는다. 영어 전용.
+std::string splitGlued(const std::string& text, const std::function<bool(const std::string&)>& isWord);
 
 // 다른 언어 자막(번역)을 문장마다 붙인다. 번역 대사 하나는 가장 많이 겹치는 문장 하나에만 들어간다.
 // 결과는 segs 와 같은 길이 (없는 문장은 빈 문자열).
