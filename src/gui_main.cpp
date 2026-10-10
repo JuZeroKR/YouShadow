@@ -1137,13 +1137,25 @@ struct App {
     }
 
     // ---- 동작 ----
+    // 문장 재생을 시작할 시각. 자막 시각은 실제 첫 단어보다 수십~수백 ms 늦은 일이 많아 ("You're gonna" 의 "You're" 가 잘려 들린다)
+    // 기본 200 ms 앞에서 시작하고, 원음 단어 시각 캐시가 있으면 첫 단어가 그 안에 들어오도록 더 당긴다 (최대 300 ms, 시킹 유예 안).
+    // 앞 문장 꼬리가 섞이지 않게 앞 문장 끝 + 60 ms 보다는 당기지 않는다 (단, 80 ms 는 보장)
+    int playStartMs(int i) {
+        const auto& s = seg(i);
+        int lead = 200;
+        if (const std::vector<Word>* ow = origWordsFor(i); ow && !ow->empty() && ow->front().startMs < 0) lead = std::max(lead, -ow->front().startMs + 100);
+        lead = std::min(lead, 300);
+        if (i > 0) lead = std::min(lead, std::max(80, s.startMs - seg(i - 1).endMs + 60));
+        return std::max(0, s.startMs - lead);
+    }
+
     // fromMs 가 있으면 그 시각부터 문장 끝까지 (반복 때도 거기로 돌아간다)
     void playSegment(int i, int loops, int fromMs = -1) {
         if (!valid(i)) return;
         stopAll();
         current = i;
         loopsLeft = std::max(1, loops);
-        loopStartMs = fromMs >= 0 ? fromMs : seg(i).startMs;
+        loopStartMs = fromMs >= 0 ? fromMs : playStartMs(i);
         seekTo(loopStartMs / 1000.0);
         mpv.setPaused(false);
         // "문장 끝에서 정지" 를 끈 상태면 그 위치부터 자유 재생 (목록은 시간에 따라 따라감)
@@ -1168,7 +1180,7 @@ struct App {
         const int dur = seg(i).endMs - seg(i).startMs;
         try { beginRecording(dur, dur * 3 + 10000); } catch (const std::exception& e) { message = e.what(); return; }
         current = i;
-        seekTo(seg(i).startMs / 1000.0);
+        seekTo(playStartMs(i) / 1000.0);
         mpv.setPaused(false);
         mode = Mode::Shadow;
         scrollToCurrent = true;
@@ -1178,7 +1190,7 @@ struct App {
         if (!valid(i)) return;
         stopAll();
         current = i;
-        seekTo(seg(i).startMs / 1000.0);
+        seekTo(playStartMs(i) / 1000.0);
         mpv.setPaused(false);
         mode = Mode::EchoListen;
         scrollToCurrent = true;
@@ -1355,7 +1367,7 @@ struct App {
             case Mode::EchoRecord:
                 if (recordingShouldStop()) {
                     finishRecording("echo");
-                    seekTo(seg(current).startMs / 1000.0);
+                    seekTo(playStartMs(current) / 1000.0);
                     mpv.setPaused(false);
                     mode = Mode::EchoCompareOrig;
                 }
@@ -3318,6 +3330,7 @@ struct App {
         else if (cmd == "dict") startDictLoad(!JaDict::installed());  // 일본어 사전 받기/로드
         else if (cmd == "ko") setShowKo(arg != "0");
         else if (cmd == "text") setShowText(arg != "0");
+        else if (cmd == "pos") fprintf(stderr, "[pos] t=%.3f current=%d start=%.3f playStart=%.3f mode=%d\n", mpv.timePos(), current, valid(current) ? seg(current).startMs / 1000.0 : -1.0, valid(current) ? playStartMs(current) / 1000.0 : -1.0, (int)mode);
         else if (cmd == "pron") { showPron = arg != "0"; db.setSetting("ja.showPron", showPron ? "1" : "0"); }
         else if (cmd == "word" && valid(current)) {  // word <k>: 현재 문장의 k 번째 단어를 클릭한 것처럼
             std::vector<std::string> ws; std::istringstream ws_(seg(current).text); for (std::string w; ws_ >> w;) ws.push_back(w);
