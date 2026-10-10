@@ -2548,7 +2548,7 @@ struct App {
         {
             bool on = showText;
             if (ImGui::Checkbox("원문 자막 (H)", &on)) setShowText(on);
-            if (ImGui::IsItemHovered()) ImGui::SetTooltip("끄면 영상 자막 · 문장 목록 · 단어 줄 · 파형의 원문을 모두 숨깁니다.\n소리만 듣고 따라 말하는 연습을 할 수 있습니다. 채점 결과와 해설은 그대로 보입니다.");
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip("끄면 영상 자막 · 문장 목록 · 단어 줄 · 파형의 원문을 모두 숨깁니다.\n소리만 듣고 따라 말하는 연습을 할 수 있습니다. 채점 뒤에도 점수만 보이고 단어별 결과는 숨깁니다. 해설은 그대로 보입니다.");
             ImGui::SameLine();
         }
         if (!video.ko.empty()) {
@@ -2873,12 +2873,15 @@ struct App {
             return;
         }
         const auto& r = lastScore;
-        drawScoreMarks(r, &lastProsody);
-        ImGui::TextDisabled("초록: 맞음  빨강: 빠짐  주황: 다르게 들림(들린 단어)  회색: 추가로 들린 단어  |  들린 문장: %s", r.heard.c_str());
+        // [원문 자막] 을 껐으면 점수만 보여 준다 (단어별 표시 · 들린 문장 · 힌트는 원문을 드러낸다)
+        drawScoreMarks(r, &lastProsody, showText);
+        if (showText) ImGui::TextDisabled("초록: 맞음  빨강: 빠짐  주황: 다르게 들림(들린 단어)  회색: 추가로 들린 단어  |  들린 문장: %s", r.heard.c_str());
+        else ImGui::TextDisabled("원문을 숨긴 상태라 점수만 보여 줍니다. 단어별 결과를 보려면 [원문 자막] 켜기 또는 H");
     }
 
-    // 정확도 + 단어별 채점 표시 (발음 채점과 문장 학습에서 공용). pv 가 있으면 억양 · 리듬 · 강세 점수와 힌트도 같이 보인다
-    void drawScoreMarks(const ScoreResult& r, const ProsodyView* pv = nullptr) {
+    // 정확도 + 단어별 채점 표시 (발음 채점과 문장 학습에서 공용). pv 가 있으면 억양 · 리듬 · 강세 점수와 힌트도 같이 보인다.
+    // words 가 거짓이면 점수 줄만 그린다 (원문 숨김 상태)
+    void drawScoreMarks(const ScoreResult& r, const ProsodyView* pv = nullptr, bool words = true) {
         auto band = [](float v) { return v >= 85 ? ImVec4(0.4f, 1, 0.5f, 1) : v >= 60 ? ImVec4(1, 0.85f, 0.3f, 1) : ImVec4(1, 0.5f, 0.5f, 1); };
         ImGui::TextColored(band(r.accuracy), "정확도 %d%% (%d/%d)", (int)r.accuracy, r.matched, r.total);
         if (pv) {
@@ -2902,6 +2905,7 @@ struct App {
             }
             if (!p.note.empty()) { ImGui::SameLine(0, 14); ImGui::TextDisabled("(%s)", p.note.c_str()); }
         }
+        if (!words) return;
         // 단어를 색으로 표시하되 패널 폭에 맞춰 직접 줄바꿈한다
         const float lineRight = ImGui::GetWindowPos().x + ImGui::GetWindowSize().x - ImGui::GetStyle().WindowPadding.x;
         const float spacing = ImGui::GetStyle().ItemSpacing.x;
@@ -3201,7 +3205,7 @@ struct App {
             // 단어 경계 · 단어: 채점 뒤에는 채점 결과의 단어 쌍을, 그 전에는 원음 단어 시각 캐시(없으면 뒤에서 인식)를 쓴다
             const std::vector<Word>* ow = textHidden() ? nullptr : origWordsFor(current);
             if (curves) {
-                drawWordTicks(rectPos, ImVec2(w, h), segDur, false);
+                if (!textHidden()) drawWordTicks(rectPos, ImVec2(w, h), segDur, false);
                 drawPitchCurve(rectPos, ImVec2(w, h), lastProsody.orig.semitone, nullptr, segDur, IM_COL32(255, 210, 80, 230), (float)lastProsody.origPadMs);
             } else if (ow) {
                 drawOrigWordLabels(rectPos, ImVec2(w, h), segDur, *ow);
@@ -3249,20 +3253,20 @@ struct App {
             }
             float ph2 = recPlayer.playing() ? ((recPlayer.positionMs() - uS) * scale + oS) / segDur : -1.0f;
             drawWaveform(mapped.data(), nBins, ImVec2(w, h), IM_COL32(120, 230, 120, 255), ph2);
-            drawWordTicks(rectPos2, ImVec2(w, h), segDur, true, uS, scale, oS);
+            if (!textHidden()) drawWordTicks(rectPos2, ImVec2(w, h), segDur, true, uS, scale, oS);
             // 원음 곡선은 점선으로 같은 자리에, 내 곡선은 옮긴 시간축으로
             static const std::vector<float> none;
             drawPitchCurve(rectPos2, ImVec2(w, h), none, &lastProsody.orig.semitone, segDur, 0, (float)lastProsody.origPadMs);
             drawPitchCurve(rectPos2, ImVec2(w, h), lastProsody.user.semitone, nullptr, segDur, IM_COL32(255, 210, 80, 255), uS, scale, oS);
-            drawWordPairTooltip(rectPos2, ImVec2(w, h), segDur, uS, scale, oS);
+            if (!textHidden()) drawWordPairTooltip(rectPos2, ImVec2(w, h), segDur, uS, scale, oS);
         } else {
             float ph2 = recPlayer.playing() && !myRec.empty() ? recPlayer.positionMs() / recDur : -1.0f;
             drawWaveform(myRecPeaks.data(), myRecPeaks.size() / 2, ImVec2(w, h), IM_COL32(120, 230, 120, 255), ph2);
             if (mine) {
-                drawWordTicks(rectPos2, ImVec2(w, h), recDur, true);
+                if (!textHidden()) drawWordTicks(rectPos2, ImVec2(w, h), recDur, true);
                 drawPitchCurve(rectPos2, ImVec2(w, h), lastProsody.user.semitone,
                                lastProsody.result.haveAlignment ? &lastProsody.result.origOnUser : nullptr, recDur, IM_COL32(255, 210, 80, 255));
-                drawWordPairTooltip(rectPos2, ImVec2(w, h), recDur);
+                if (!textHidden()) drawWordPairTooltip(rectPos2, ImVec2(w, h), recDur);
             }
         }
 
