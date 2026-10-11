@@ -57,11 +57,12 @@ if (-not (Test-Path "whisper.cpp\CMakeLists.txt")) {
     git -C whisper.cpp checkout -q c44b60b8053bbf2a5c1e014f11323fb3f2485177
 }
 # whisper.cpp 패치 (scripts/patches/*.patch). 이미 적용돼 있으면 건너뛴다. 받아 둔 checkout 에도 새 패치를 적용한다
+# (git 의 stderr 출력은 $ErrorActionPreference=Stop 아래서 오류로 잡히므로 cmd 를 거쳐 종료 코드만 본다. 줄 끝(CRLF/LF) 차이는 무시)
 foreach ($patch in Get-ChildItem (Join-Path $root "scripts\patches\*.patch") -ErrorAction SilentlyContinue) {
-    git -C whisper.cpp apply --reverse --check $patch.FullName 2>$null
+    cmd /c "git -C whisper.cpp apply --reverse --check --ignore-whitespace ""$($patch.FullName)"" >nul 2>&1"
     if ($LASTEXITCODE -eq 0) { continue }  # 이미 적용됨
     Step "whisper.cpp 패치: $($patch.Name)"
-    git -C whisper.cpp apply $patch.FullName
+    cmd /c "git -C whisper.cpp apply --ignore-whitespace ""$($patch.FullName)"" 2>&1"
     if ($LASTEXITCODE -ne 0) { throw "패치 적용 실패: $($patch.Name)" }
 }
 

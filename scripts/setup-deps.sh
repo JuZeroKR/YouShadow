@@ -54,9 +54,9 @@ fi
 # whisper.cpp 패치 (scripts/patches/*.patch). 이미 적용돼 있으면 건너뛴다. 받아 둔 checkout 에도 새 패치를 적용한다
 for patch in "$root"/scripts/patches/*.patch; do
     [[ -f "$patch" ]] || continue
-    if git -C whisper.cpp apply --reverse --check "$patch" 2>/dev/null; then continue; fi
+    if git -C whisper.cpp apply --reverse --check --ignore-whitespace "$patch" 2>/dev/null; then continue; fi
     step "whisper.cpp 패치: $(basename "$patch")"
-    git -C whisper.cpp apply "$patch"
+    git -C whisper.cpp apply --ignore-whitespace "$patch"
 done
 
 # 5. GLFW / libmpv / 실행 도구 (Homebrew)

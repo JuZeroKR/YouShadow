@@ -1,0 +1,2 @@
+# 패치 파일은 줄 끝을 바꾸지 않는다 (git apply 가 LF 원본과 맞춰야 한다)
+scripts/patches/*.patch -text
