@@ -14,7 +14,10 @@
 namespace {
 
 // 환경 변수 YS_WHISPER_LOG=1 이면 whisper 로그를 stderr 로 흘린다 (디버그용)
-void quietLog(enum ggml_log_level, const char* msg, void*) { if (std::getenv("YS_WHISPER_LOG")) fputs(msg, stderr); }
+// whisper / ggml 로그. 평소엔 조용히 하되 오류(WHISPER_ASSERT 가 죽기 직전 남기는 메시지 포함)는 늘 stderr 에 남긴다 — 원인 추적용
+void quietLog(enum ggml_log_level level, const char* msg, void*) {
+    if (level == GGML_LOG_LEVEL_ERROR || std::getenv("YS_WHISPER_LOG")) { fputs(msg, stderr); fflush(stderr); }
+}
 
 std::string trim(const std::string& s) {
     size_t b = 0, e = s.size();
@@ -60,7 +63,7 @@ bool Stt::load(const std::string& modelPath, std::string* err, Lang lang) {
     // 토큰 시각을 교차 주의 정렬(DTW) 로 구한다. 기본 휴리스틱은 짧은 클립에서 마지막 단어를 뒤의 무음 패딩에 놓거나
     // 첫 단어를 너무 길게 잡는 일이 잦아 리듬 · 강세 비교가 틀어진다. 모델이 프리셋과 맞지 않으면 whisper 가 스스로 끈다 (t_dtw = -1)
     cp.flash_attn = false;  // flash attention과 DTW 시각은 같이 쓸 수 없다 (켜져 있으면 whisper 가 DTW 를 끈다)
-    cp.dtw_token_timestamps = true;
+    cp.dtw_token_timestamps = std::getenv("YS_NO_DTW") == nullptr;  // YS_NO_DTW=1: 진단용 (DTW 끄기)
     cp.dtw_aheads_preset = lang == Lang::Ja ? WHISPER_AHEADS_SMALL : WHISPER_AHEADS_BASE_EN;
     ctx_ = whisper_init_from_file_with_params(modelPath.c_str(), cp);
     if (!ctx_) {
@@ -92,7 +95,7 @@ std::vector<Word> Stt::transcribe(const std::vector<float>& pcm16k,
     p.print_realtime = false;
     p.print_timestamps = false;
     p.print_special = false;
-    p.token_timestamps = true;
+    p.token_timestamps = std::getenv("YS_NO_TT") == nullptr;  // YS_NO_TT=1: 진단용 (토큰 시각 끄기)
     p.suppress_blank = true;
     p.progress_callback = progressThunk;
     p.progress_callback_user_data = const_cast<std::function<void(int)>*>(&progress);

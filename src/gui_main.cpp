@@ -23,6 +23,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <exception>
 #include <filesystem>
 #include <fstream>
 #include <map>
@@ -491,6 +492,7 @@ struct App {
     struct OrigWords { std::vector<Word> words; bool wide = false; int leadMiss = 0, tailMiss = 0; };  // leadMiss/tailMiss: 기준 문장 앞뒤에서 인식 못 한 단어 수
     std::map<int, OrigWords> origWordsCache;
     std::set<int> origWordsTried;  // 인식을 시도한 문장 (실패해도 다시 돌리지 않는다)
+    std::set<int> origWordsMissing;  // DB 에 캐시가 없다고 확인한 문장 (매 프레임 DB 를 두드리지 않게. 인식이 끝나면 비운다)
     std::vector<Word> origRelScratch;  // origWordsFor 가 돌려주는, 구간 시작 기준으로 옮긴 사본
     // 문장의 실제 재생 구간 (ms). 자막 큐가 실제 말과 어긋난 문장은 whisper 단어 시각으로 잡은 구간
     struct Span { int startMs = 0, endMs = 0; };
@@ -1565,6 +1567,7 @@ struct App {
                     if (!origWordsJob.jsonOut.empty() && loaded && origWordsJob.videoId == video.id && valid(origWordsJob.segIdx)) {
                         db.setSegWords(video.id, origWordsJob.segIdx, origWordsJob.jsonOut);
                         origWordsCache.erase(origWordsJob.segIdx);
+                        origWordsMissing.erase(origWordsJob.segIdx);
                     }
                 }
             }
@@ -1599,8 +1602,9 @@ struct App {
             return &it->second;
         }
         const auto& s = seg(i);
+        if (origWordsMissing.count(i)) { requestOrigWords(i); return nullptr; }
         const std::string json = db.getSegWords(video.id, i);
-        if (json.empty()) { requestOrigWords(i); return nullptr; }
+        if (json.empty()) { origWordsMissing.insert(i); requestOrigWords(i); return nullptr; }
         int base = -1, pad = -1;
         std::vector<Word> all = prosody::wordsFromJson(json, &base, &pad);
         if (base < 0) base = s.startMs - std::min(video.lang == Lang::Ja ? 0 : ScoreJob::kOrigPadMs, s.startMs);  // 옛 형식: 300 ms 여유 클립
@@ -1659,6 +1663,14 @@ struct App {
         const int first = ow->words.front().startMs, last = ow->words.back().endMs;
         sp.startMs = std::clamp(first - 100 - 250 * ow->leadMiss, s.startMs - lim, s.startMs + lim);
         sp.endMs = std::clamp(std::max(last + 150, std::min(s.endMs, last + 700)) + 250 * ow->tailMiss, s.endMs - lim, s.endMs + lim);
+        // 다음 문장의 첫 단어보다 뒤로는 가지 않는다. 같은 단어가 경계에 되풀이될 때("…you read Seneca. Seneca apparently…") 정렬이
+        // 뒤쪽 것에 붙어 다음 문장 머리를 끌어오는 것을 막는다
+        if (valid(i + 1)) {
+            if (const OrigWords* nx = origAbs(i + 1); nx && nx->wide && !nx->words.empty()) {
+                const int nxStart = nx->words.front().startMs - 100;
+                if (nxStart < sp.endMs && nxStart > sp.startMs + 300) sp.endMs = nxStart;
+            }
+        }
         if (sp.endMs - sp.startMs < 300) return Span{s.startMs, s.endMs};
         return sp;
     }
@@ -1696,6 +1708,7 @@ struct App {
         current = -1;
         origWordsCache.clear();
         origWordsTried.clear();
+        origWordsMissing.clear();
         myRec.clear();
         myRecPeaks.clear();
         haveScore = false;
@@ -3647,6 +3660,29 @@ void installCrashHandler() {
 }
 #endif
 
+// 잡히지 않은 C++ 예외로 종료될 때 (std::terminate) 어떤 예외였는지 crash.log 와 stderr 에 남긴다.
+// Windows 에서는 terminate → abort → fast-fail(0xC0000409) 이라 위의 SEH 핸들러에 안 걸리고 메시지도 없이 죽는다
+void installTerminateHandler() {
+    std::set_terminate([] {
+        std::string what = "알 수 없음";
+        if (auto ep = std::current_exception()) {
+            try { std::rethrow_exception(ep); }
+            catch (const std::exception& e) { what = e.what(); }
+            catch (...) { what = "std::exception 이 아닌 예외"; }
+        }
+        char buf[1200];
+        snprintf(buf, sizeof buf, "YouShadow v%s terminate: %s\r\n", YS_VERSION, what.c_str());
+        fputs(buf, stderr);
+        fflush(stderr);
+        std::string path = paths::logDir() + "/crash.log";
+        if (FILE* f = fopen(path.c_str(), "ab")) { fputs(buf, f); fclose(f); }
+#ifdef _WIN32
+        MessageBoxA(nullptr, (std::string("프로그램에 문제가 생겨 종료합니다.\n\n") + buf + "\n로그: " + path).c_str(), "YouShadow", MB_ICONERROR);
+#endif
+        std::abort();
+    });
+}
+
 }  // namespace
 
 #ifndef YS_VERSION
@@ -3659,6 +3695,7 @@ int main(int argc, char** argv) {
 #endif
     paths::setup();
     installCrashHandler();
+    installTerminateHandler();
 
     glfwSetErrorCallback(glfwError);
     if (!glfwInit()) return 1;

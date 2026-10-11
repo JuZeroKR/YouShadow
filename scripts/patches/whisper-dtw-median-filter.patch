@@ -1,0 +1,25 @@
+whisper.cpp: DTW 토큰 시각의 median filter 가 짧은 창(오디오 토큰 수 < 필터 폭 7)에서 WHISPER_ASSERT 로 프로세스를 죽이는 문제.
+30초 창이 몇 프레임만 전진했을 때(seek_delta 가 작을 때) 생기며, 특정 문장을 앞뒤 1.5초 넓혀 인식하다 앱이 통째로 종료됐다
+(YouShadow v0.6.6, "filter_width < a->ne[2]"). 상류 PR #4096 (https://github.com/ggml-org/whisper.cpp/pull/4096) 과 같은 수정:
+필터 폭을 창에 맞게 줄인다 (1 이면 필터 없음). 상류에 합쳐지면 whisper.cpp 커밋을 올리고 이 패치를 지우면 된다.
+scripts/setup-deps.ps1 / setup-deps.sh 가 checkout 뒤에 적용한다.
+
+--- a/src/whisper.cpp
++++ b/src/whisper.cpp
+@@ -9073,7 +9073,15 @@ static void median_filter(struct ggml_tensor * dst , const struct ggml_tensor *
+         return;
+     }
+     int filter_width = ((median_filter_user_data *) userdata)->filter_width;
+-    WHISPER_ASSERT(filter_width < a->ne[2]);
++    // A window that advanced only a few frames has fewer audio tokens than
++    // the filter is wide: narrow the filter instead of aborting (1: none).
++    if (filter_width >= a->ne[2]) {
++        filter_width = (a->ne[2] % 2) ? (int) a->ne[2] - 2 : (int) a->ne[2] - 1;
++        if (filter_width < 1) {
++            filter_width = 1;
++        }
++    }
++    WHISPER_ASSERT(filter_width < a->ne[2] || filter_width == 1);
+     WHISPER_ASSERT(filter_width % 2);
+     WHISPER_ASSERT(ggml_n_dims(a) == 3);
+     WHISPER_ASSERT(a->type == GGML_TYPE_F32);

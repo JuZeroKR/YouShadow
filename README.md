@@ -128,6 +128,8 @@ cmake --build build -j
 | [SQLite](https://www.sqlite.org/) | 학습 기록 |
 | [nlohmann/json](https://github.com/nlohmann/json) | 자막 파싱 |
 
+whisper.cpp 는 고정 커밋을 받은 뒤 `scripts/patches/*.patch` 를 적용한다 (현재: DTW 토큰 시각의 median filter 가 짧은 창에서 assert 로 프로그램을 죽이는 문제 — 상류 PR #4096 과 같은 수정). 이미 받아 둔 checkout 에도 스크립트를 다시 돌리면 적용된다.
+
 ### 배포 패키지 만들기
 
 ```powershell

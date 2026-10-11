@@ -56,6 +56,14 @@ if (-not (Test-Path "whisper.cpp\CMakeLists.txt")) {
     git clone -q https://github.com/ggml-org/whisper.cpp.git whisper.cpp
     git -C whisper.cpp checkout -q c44b60b8053bbf2a5c1e014f11323fb3f2485177
 }
+# whisper.cpp 패치 (scripts/patches/*.patch). 이미 적용돼 있으면 건너뛴다. 받아 둔 checkout 에도 새 패치를 적용한다
+foreach ($patch in Get-ChildItem (Join-Path $root "scripts\patches\*.patch") -ErrorAction SilentlyContinue) {
+    git -C whisper.cpp apply --reverse --check $patch.FullName 2>$null
+    if ($LASTEXITCODE -eq 0) { continue }  # 이미 적용됨
+    Step "whisper.cpp 패치: $($patch.Name)"
+    git -C whisper.cpp apply $patch.FullName
+    if ($LASTEXITCODE -ne 0) { throw "패치 적용 실패: $($patch.Name)" }
+}
 
 # 6. libmpv (zhongfly/mpv-winbuild dev 패키지) + MSVC import lib 생성
 # 상류 릴리스는 한 달쯤 지나면 지워져서 (v0.6.1 CI 실패) 우리 저장소 릴리스(mpv-dev-20261009) 에 올려 둔 사본을 받는다.

@@ -51,6 +51,13 @@ if [[ ! -f whisper.cpp/CMakeLists.txt ]]; then
     git clone -q https://github.com/ggml-org/whisper.cpp.git whisper.cpp
     git -C whisper.cpp checkout -q c44b60b8053bbf2a5c1e014f11323fb3f2485177
 fi
+# whisper.cpp 패치 (scripts/patches/*.patch). 이미 적용돼 있으면 건너뛴다. 받아 둔 checkout 에도 새 패치를 적용한다
+for patch in "$root"/scripts/patches/*.patch; do
+    [[ -f "$patch" ]] || continue
+    if git -C whisper.cpp apply --reverse --check "$patch" 2>/dev/null; then continue; fi
+    step "whisper.cpp 패치: $(basename "$patch")"
+    git -C whisper.cpp apply "$patch"
+done
 
 # 5. GLFW / libmpv / 실행 도구 (Homebrew)
 if command -v brew >/dev/null; then
