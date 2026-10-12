@@ -1719,6 +1719,9 @@ struct App {
         int durMs = (int)(video.peaks.size() / 2) * kPeakBinMs;
         db.upsertVideo(video.id, video.title, durMs, video.lang);
         readings.clear();
+        roughReadings.clear();     // 문장 번호로 찾는 캐시라 비우지 않으면 새 영상에서 이전 영상의 단어가 보인다
+        readingRequested.clear();
+        readingPending.clear();
         if (video.lang == Lang::Ja) {
             for (int i = 0; i < (int)video.segs.size(); ++i) {
                 std::string j = db.getReading(video.id, i);
