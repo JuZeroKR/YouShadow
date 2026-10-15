@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <limits>
 #include <utility>
 
@@ -60,6 +61,21 @@ constexpr int kHintMinWordMs = 80;                 // 길이 힌트를 낼 최�
 constexpr float kHintLoud = 0.20f;
 constexpr float kHintPitchSt = 3.f;
 constexpr int kMaxHints = 4;
+// MFCC (발음)
+constexpr int kMfccWin = 400;                      // 25 ms 창 (프레임 시작 160k 부터)
+constexpr int kMfccFft = 512;
+constexpr int kMfccMel = 26;                       // 멜 필터 수
+constexpr float kPreEmph = 0.97f;
+constexpr int kMinMfccFrames = 3;                  // 단어별 비교에 필요한 최소 프레임 (양쪽)
+constexpr float kSoundBandFrac = 0.35f;            // 단어별 DTW 띠
+constexpr int kSoundBandMin = 6;
+constexpr float kSoundStepPenalty = 0.05f;
+// 발음 점수. 단어별: 맞는 단어끼리의 거리를 같은 문장의 이웃 단어(엉뚱한 짝)와의 거리로 나눈 비율 — 1.0 이면 아무 단어나 댄 것과 같고
+// 0.55 아래면 거의 같은 소리. 실제 녹음 10개로 맞춤 (정확도 80% 이상 0.59~0.81, 35% 이하 0.63~1.0). 전체 DTW 는 절대 거리를 쓴다
+constexpr float kPronRatioFull = 0.55f, kPronRatioRange = 0.45f;   // 비율 0.55 → 100, 1.00 → 0
+constexpr float kPronAbsTol = 0.45f, kPronAbsRange = 0.45f;        // 절대 거리 0.45 → 100, 0.90 → 0 (문장 전체 비교일 때)
+constexpr int kSoundNbr = 2;                                       // 기준으로 삼는 이웃 단어 범위 (±2)
+constexpr int kSoundWordMinFrames = 12;                            // 단어별 점수 · 힌트를 낼 최소 단어 길이 (120 ms, 양쪽). 짧은 기능어는 들쭉날쭉하다
 
 constexpr float kPi = 3.14159265358979f;
 constexpr float kInf = 1e30f;
@@ -226,6 +242,134 @@ bool dtwAlign(const Track& o, const Track& u, std::vector<std::pair<int, int>>* 
     }
     std::reverse(path->begin(), path->end());
     return true;
+}
+
+// ---- MFCC ----
+// 제자리 radix-2 FFT (re, im 길이 n = 2^k)
+void fft(std::vector<float>& re, std::vector<float>& im) {
+    const int n = (int)re.size();
+    for (int i = 1, j = 0; i < n; ++i) {
+        int bit = n >> 1;
+        for (; j & bit; bit >>= 1) j ^= bit;
+        j ^= bit;
+        if (i < j) { std::swap(re[i], re[j]); std::swap(im[i], im[j]); }
+    }
+    for (int len = 2; len <= n; len <<= 1) {
+        const float ang = -2.f * kPi / (float)len;
+        const float wr = std::cos(ang), wi = std::sin(ang);
+        for (int i = 0; i < n; i += len) {
+            float cr = 1.f, ci = 0.f;
+            for (int k = 0; k < len / 2; ++k) {
+                const int a = i + k, b = i + k + len / 2;
+                const float tr = re[b] * cr - im[b] * ci, ti = re[b] * ci + im[b] * cr;
+                re[b] = re[a] - tr; im[b] = im[a] - ti;
+                re[a] += tr; im[a] += ti;
+                const float ncr = cr * wr - ci * wi;
+                ci = cr * wi + ci * wr; cr = ncr;
+            }
+        }
+    }
+}
+
+struct MfccTables {
+    std::vector<float> window;                                    // 해밍 (kMfccWin)
+    std::vector<std::vector<std::pair<int, float>>> filters;      // 멜 필터별 (bin, 가중치)
+    std::vector<float> dct;                                       // (kMfccDim) x (kMfccMel)
+    MfccTables() {
+        window.resize(kMfccWin);
+        for (int i = 0; i < kMfccWin; ++i) window[i] = 0.54f - 0.46f * std::cos(2.f * kPi * (float)i / (float)(kMfccWin - 1));
+        auto mel = [](float hz) { return 2595.f * std::log10(1.f + hz / 700.f); };
+        auto hzOf = [](float m) { return 700.f * (std::pow(10.f, m / 2595.f) - 1.f); };
+        const float mLo = mel(0.f), mHi = mel((float)kRate / 2.f);
+        std::vector<int> bins(kMfccMel + 2);
+        for (int i = 0; i < kMfccMel + 2; ++i) {
+            const float hz = hzOf(mLo + (mHi - mLo) * (float)i / (float)(kMfccMel + 1));
+            bins[i] = (int)std::floor((float)(kMfccFft + 1) * hz / (float)kRate);
+        }
+        filters.resize(kMfccMel);
+        for (int m = 0; m < kMfccMel; ++m) {
+            const int a = bins[m], b = bins[m + 1], c = bins[m + 2];
+            for (int k = a; k < b; ++k) if (b > a) filters[m].push_back({k, (float)(k - a) / (float)(b - a)});
+            for (int k = b; k < c; ++k) if (c > b) filters[m].push_back({k, (float)(c - k) / (float)(c - b)});
+            if (filters[m].empty()) filters[m].push_back({b, 1.f});
+        }
+        dct.resize((size_t)kMfccDim * kMfccMel);
+        for (int i = 0; i < kMfccDim; ++i)
+            for (int j = 0; j < kMfccMel; ++j)
+                dct[(size_t)i * kMfccMel + j] = std::cos(kPi * (float)(i + 1) * ((float)j + 0.5f) / (float)kMfccMel);
+    }
+};
+
+// 프레임별 MFCC c1..c12 (정규화 전). 프레임 k 의 창은 [160k, 160k+400) — 다른 분석과 같은 눈금
+void computeMfcc(const std::vector<float>& pcm, int frames, std::vector<float>& out) {
+    static const MfccTables T;
+    out.assign((size_t)frames * kMfccDim, 0.f);
+    std::vector<float> re(kMfccFft), im(kMfccFft), melE(kMfccMel);
+    for (int k = 0; k < frames; ++k) {
+        const size_t base = (size_t)k * kHop;
+        if (base + kMfccWin > pcm.size()) break;
+        std::fill(re.begin(), re.end(), 0.f);
+        std::fill(im.begin(), im.end(), 0.f);
+        for (int i = 0; i < kMfccWin; ++i) {
+            const float prev = base + i > 0 ? pcm[base + i - 1] : 0.f;
+            re[i] = (pcm[base + i] - kPreEmph * prev) * T.window[i];
+        }
+        fft(re, im);
+        for (int m = 0; m < kMfccMel; ++m) {
+            double e = 0;
+            for (const auto& [bin, w] : T.filters[m]) e += (double)w * ((double)re[bin] * re[bin] + (double)im[bin] * im[bin]);
+            melE[m] = std::log((float)e + 1e-10f);
+        }
+        float* c = out.data() + (size_t)k * kMfccDim;
+        for (int i = 0; i < kMfccDim; ++i) {
+            float v = 0.f;
+            for (int j = 0; j < kMfccMel; ++j) v += T.dct[(size_t)i * kMfccMel + j] * melE[j];
+            c[i] = v;
+        }
+    }
+}
+
+// 두 프레임 구간 [a0,a1) · [b0,b1) 의 MFCC 를 DTW 로 맞춘 평균 거리 (유클리드 / sqrt(dim), 경로 길이로 나눔). 실패하면 -1
+// 두 프레임 구간 [a0,a1) · [b0,b1) 의 MFCC 를 DTW 로 맞춘 평균 코사인 거리 (경로 길이로 나눔). 실패하면 -1.
+// 유클리드보다 코사인이 화자 차이에 덜 흔들린다 (실제 녹음에서 맞는 단어 · 엉뚱한 단어의 구분이 가장 컸다)
+float mfccDtw(const Track& a, int a0, int a1, const Track& b, int b0, int b1) {
+    const int nA = a1 - a0, nB = b1 - b0;
+    const int dim = kMfccDim;
+    if (nA <= 0 || nB <= 0 || a.mfcc.size() < (size_t)a1 * dim || b.mfcc.size() < (size_t)b1 * dim) return -1.f;
+    const float hw = std::max(kSoundBandFrac * (float)std::max(nA, nB), (float)kSoundBandMin);
+    auto dist = [&](int i, int j) {
+        const float* x = a.mfcc.data() + (size_t)(a0 + i) * dim;
+        const float* y = b.mfcc.data() + (size_t)(b0 + j) * dim;
+        float xy = 0.f, xx = 0.f, yy = 0.f;
+        for (int k = 0; k < dim; ++k) { xy += x[k] * y[k]; xx += x[k] * x[k]; yy += y[k] * y[k]; }
+        return 1.f - xy / (std::sqrt(xx * yy) + 1e-6f);
+    };
+    std::vector<float> D((size_t)nA * nB, kInf);
+    std::vector<int> L((size_t)nA * nB, 0);  // 경로 길이
+    auto at = [&](int i, int j) -> float { return (i < 0 || j < 0) ? kInf : D[(size_t)i * nB + j]; };
+    auto len = [&](int i, int j) -> int { return (i < 0 || j < 0) ? 0 : L[(size_t)i * nB + j]; };
+    for (int i = 0; i < nA; ++i) {
+        const float jc = (float)i * nB / (float)nA;
+        const int jl = std::max(0, (int)std::floor(jc - hw)), jh = std::min(nB - 1, (int)std::ceil(jc + hw));
+        for (int j = jl; j <= jh; ++j) {
+            const float c = dist(i, j);
+            float best; int bl;
+            if (i == 0 && j == 0) { best = 0.f; bl = 0; }
+            else {
+                const float d0 = at(i - 1, j - 1), d1 = at(i - 1, j) + kSoundStepPenalty, d2 = at(i, j - 1) + kSoundStepPenalty;
+                if (d0 <= d1 && d0 <= d2) { best = d0; bl = len(i - 1, j - 1); }
+                else if (d1 <= d2) { best = d1; bl = len(i - 1, j); }
+                else { best = d2; bl = len(i, j - 1); }
+            }
+            if (best >= kInf) continue;
+            D[(size_t)i * nB + j] = best + c;
+            L[(size_t)i * nB + j] = bl + 1;
+        }
+    }
+    const float total = at(nA - 1, nB - 1);
+    const int n = len(nA - 1, nB - 1);
+    if (total >= kInf || n <= 0) return -1.f;
+    return total / (float)n;
 }
 
 float pearson(double n, double sx, double sy, double sxx, double syy, double sxy) {
@@ -419,7 +563,38 @@ Track analyze(const std::vector<float>& pcm, const std::vector<Word>& words) {
     if (t.medianHz > 0.f)
         for (int k = 0; k < frames; ++k)
             if (t.voiced[k]) t.semitone[k] = 12.f * std::log2(t.hz[k] / t.medianHz);
+
+    // ---- 7. MFCC: 말소리 구간(inWord) 기준으로 계수마다 평균 0 · 분산 1 (화자 · 마이크 · 음량 차이를 줄인다) ----
+    computeMfcc(pcm, frames, t.mfcc);
+    {
+        std::vector<double> mean(kMfccDim, 0.0), var(kMfccDim, 0.0);
+        int cnt = 0;
+        for (int k = 0; k < frames; ++k) {
+            if (!t.inWord[k]) continue;
+            for (int i = 0; i < kMfccDim; ++i) mean[(size_t)i] += t.mfcc[(size_t)k * kMfccDim + i];
+            ++cnt;
+        }
+        if (cnt >= 5) {
+            for (auto& m : mean) m /= cnt;
+            for (int k = 0; k < frames; ++k) {
+                if (!t.inWord[k]) continue;
+                for (int i = 0; i < kMfccDim; ++i) { const double d = t.mfcc[(size_t)k * kMfccDim + i] - mean[(size_t)i]; var[(size_t)i] += d * d; }
+            }
+            for (int i = 0; i < kMfccDim; ++i) {
+                const float sd = (float)std::sqrt(var[(size_t)i] / cnt) + 1e-3f;
+                for (int k = 0; k < frames; ++k) t.mfcc[(size_t)k * kMfccDim + i] = (t.mfcc[(size_t)k * kMfccDim + i] - (float)mean[(size_t)i]) / sd;
+            }
+        }
+    }
     return t;
+}
+
+float soundDistance(const Track& a, int aStartMs, int aEndMs, const Track& b, int bStartMs, int bEndMs) {
+    int a0, a1, b0, b1;
+    if (!frameRange((float)aStartMs, (float)aEndMs, a.frames(), &a0, &a1)) return -1.f;
+    if (!frameRange((float)bStartMs, (float)bEndMs, b.frames(), &b0, &b1)) return -1.f;
+    if (a1 - a0 + 1 < kMinMfccFrames || b1 - b0 + 1 < kMinMfccFrames) return -1.f;
+    return mfccDtw(a, a0, a1 + 1, b, b0, b1 + 1);
 }
 
 Result compare(const Track& orig, const std::vector<Word>& origWords,
@@ -584,6 +759,63 @@ Result compare(const Track& orig, const std::vector<Word>& origWords,
         r.note = r.haveStress ? "속도 차이가 커서 억양 비교 생략" : "속도 차이가 커서 억양·강세 비교 생략";
     }
 
+    // ---- 7b. 발음 (소리 유사도) ----
+    // 단어마다 원음 · 내 녹음의 MFCC 를 DTW 로 맞춘 코사인 거리를 잰다. 절대 거리는 화자 · 마이크에 따라 통째로 움직여 쓸모가 없어,
+    // 같은 문장의 이웃 단어(엉뚱한 짝)와의 거리로 나눈 비율을 쓴다: 1.0 이면 아무 단어나 댄 것과 같고 작을수록 그 단어 소리에 가깝다.
+    // 단어 정렬이 없으면(일본어, 인식 실패) 말소리 전체를 DTW 로 맞춘 절대 거리로 대신한다
+    {
+        struct WordFrames { int o0, o1, u0, u1; };
+        std::vector<WordFrames> wf(anchors.size(), {-1, -1, -1, -1});
+        for (size_t i = 0; i < anchors.size(); ++i) {
+            auto& p = anchors[i];
+            int o0, o1, u0, u1;
+            if (!frameRange((float)p.origStartMs, (float)p.origEndMs, orig.frames(), &o0, &o1)) continue;
+            if (!frameRange((float)p.userStartMs, (float)p.userEndMs, user.frames(), &u0, &u1)) continue;
+            if (o1 - o0 + 1 < kMinMfccFrames || u1 - u0 + 1 < kMinMfccFrames) continue;
+            const float d = mfccDtw(orig, o0, o1 + 1, user, u0, u1 + 1);
+            if (d < 0.f) continue;
+            wf[i] = {o0, o1 + 1, u0, u1 + 1};
+            p.soundDist = d;
+            p.hasSound = true;
+        }
+        double sumRatio = 0, wsum = 0;
+        int cnt = 0;
+        for (size_t i = 0; i < anchors.size(); ++i) {
+            auto& p = anchors[i];
+            if (!p.hasSound) continue;
+            // 기준: 원음의 이 단어 ↔ 내 녹음의 이웃 단어 (±kSoundNbr) 거리 평균
+            double b = 0; int nb = 0;
+            for (int d = -kSoundNbr; d <= kSoundNbr; ++d) {
+                if (d == 0) continue;
+                const long j = (long)i + d;
+                if (j < 0 || j >= (long)anchors.size() || !anchors[(size_t)j].hasSound) continue;
+                const float dd = mfccDtw(orig, wf[i].o0, wf[i].o1, user, wf[(size_t)j].u0, wf[(size_t)j].u1);
+                if (dd >= 0.f) { b += dd; ++nb; }
+            }
+            if (nb == 0) continue;
+            const float ratio = p.soundDist / (float)(b / nb + 1e-6);
+            // 단어별 점수는 양쪽 모두 충분히 긴 단어에만 (짧은 기능어는 0 ↔ 100 을 오간다). 문장 점수에는 길이 가중으로 모두 넣는다
+            if (wf[i].o1 - wf[i].o0 >= kSoundWordMinFrames && wf[i].u1 - wf[i].u0 >= kSoundWordMinFrames)
+                p.soundScore = 100.f * clamp01(1.f - (ratio - kPronRatioFull) / kPronRatioRange);
+            const double w = (double)(wf[i].o1 - wf[i].o0);
+            sumRatio += ratio * w; wsum += w; ++cnt;
+        }
+        if (cnt >= 2 && cnt >= needAnchors) {
+            const float ratio = (float)(sumRatio / wsum);
+            r.soundDist = ratio;
+            r.pron = 100.f * clamp01(1.f - (ratio - kPronRatioFull) / kPronRatioRange);
+            r.pronByWords = true;
+            r.havePron = true;
+        } else if (!dtwSkippedBySpeed) {
+            const float d = mfccDtw(orig, orig.speechStart, orig.speechEnd, user, user.speechStart, user.speechEnd);
+            if (d >= 0.f) {
+                r.soundDist = d;
+                r.pron = 100.f * clamp01(1.f - (d - kPronAbsTol) / kPronAbsRange);
+                r.havePron = true;
+            }
+        }
+    }
+
     // ---- 8. 힌트: 문턱 대비 크기가 큰 것부터 최대 4개 ----
     struct Cand { float mag; Hint h; };
     std::vector<Cand> cands;
@@ -602,6 +834,8 @@ Result compare(const Track& orig, const std::vector<Word>& origWords,
             cands.push_back({std::fabs(p.loudDiff) / kHintLoud, {p.refIdx, q + (p.loudDiff > 0.f ? "더 약하게" : "더 세게")}});
         if (p.hasPitch && std::fabs(p.pitchDiffSt) > kHintPitchSt)
             cands.push_back({std::fabs(p.pitchDiffSt) / kHintPitchSt, {p.refIdx, q + (p.pitchDiffSt > 0.f ? "더 낮게" : "더 높게")}});
+        if (p.soundScore >= 0.f && p.soundScore < kSoundScoreHint)
+            cands.push_back({(kSoundScoreHint - p.soundScore) / kSoundScoreHint + 1.f, {p.refIdx, q + "소리가 다름 (우클릭으로 원음과 비교해 들어 보세요)"}});
     }
     std::stable_sort(cands.begin(), cands.end(), [](const Cand& a, const Cand& b) { return a.mag > b.mag; });
     for (size_t i = 0; i < cands.size() && (int)i < kMaxHints; ++i) r.hints.push_back(cands[i].h);

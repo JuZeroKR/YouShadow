@@ -11,12 +11,14 @@
 //  - 억양: 음높이 곡선. 각자 자기 중앙값 기준 반음으로 바꿔 목소리 높낮이 차이를 없앤 뒤 DTW 로 시간을 맞춰 비교
 //  - 리듬: whisper 단어 시각으로 단어별 길이 비율과 쉼, 전체 속도
 //  - 강세: 상대 크기(0~1) 의 단어별 차이
+//  - 발음(소리 유사도): 말소리의 스펙트럼 모양(MFCC) 을 DTW 로 맞춰 비교. 같은 소리를 내면 화자가 달라도 가깝고, 다른 소리(모음 · 자음) 를 내면 멀다
 // 두 클립 모두 mono 16 kHz float. 프레임은 10 ms (kHop) 간격이라 whisper 센티초 시각 · 파형 피크(kPeakBinMs) 와 같은 눈금이다.
 namespace prosody {
 
 constexpr int kRate = 16000;
 constexpr int kHopMs = 10;
 constexpr int kHop = 160;
+constexpr int kMfccDim = 12;    // MFCC 계수 수 (c1..c12, 에너지 c0 는 뺀다 — 크기는 강세에서 따로 본다)
 
 // 한 클립의 프레임별 분석 결과. 프레임 k 의 중심 시각은 k*10 + 20 ms 근처 (분석 창 길이에 따라).
 struct Track {
@@ -25,6 +27,7 @@ struct Track {
     std::vector<float> loud;        // 상대 크기 0~1 (바닥 + 10 dB → 0, 95 퍼센타일 → 1)
     std::vector<uint8_t> voiced;    // 1 이면 유성음 (주기성 + 에너지 조건 통과)
     std::vector<uint8_t> inWord;    // 1 이면 프레임 중심이 (앞뒤 여유를 둔) 단어 구간 안
+    std::vector<float> mfcc;        // 프레임별 MFCC c1..c12 (frames()*kMfccDim). 말소리 구간 기준으로 평균 0 · 분산 1 로 맞춘 값 (화자 · 마이크 차이 완화)
     int speechStart = 0, speechEnd = 0;  // 말소리 구간 [start, end) 프레임
     float medianHz = 0.f;           // 유성음 F0 중앙값
     bool hasDynamics = true;        // 크기 변화가 충분한가 (95p − 5p − 10 dB ≥ 6 dB). 아니면 강세 비교 불가
@@ -44,7 +47,12 @@ struct WordPair {
     float loudDiff = 0.f;           // 내 평균 크기 − 원음 평균 크기 (0~1 단위). > 0 이면 내가 세게
     float pitchDiffSt = 0.f;        // 내 평균 음높이 − 원음 (반음). 둘 다 유성음인 프레임만. hasPitch 가 true 일 때만 의미 있음
     bool hasPitch = false;
+    float soundDist = 0.f;          // 소리 거리: 이 단어의 MFCC 를 DTW 로 맞춘 평균 코사인 거리 (0 = 같은 소리)
+    float soundScore = -1.f;        // 0~100. 같은 문장의 이웃 단어(엉뚱한 단어)와의 거리를 기준으로 얼마나 더 가까운가 — 화자 · 마이크 차이를 상쇄. -1 이면 기준이 없음
+    bool hasSound = false;
 };
+
+constexpr float kSoundScoreHint = 30.f;  // 단어 소리 점수가 이보다 낮으면 힌트 · 단어 아래 "소리" 표시
 
 // 사용자에게 보여 줄 한 줄 힌트. refIdx 가 -1 이면 문장 전체에 대한 것 (예: 속도)
 struct Hint {
@@ -53,9 +61,11 @@ struct Hint {
 };
 
 struct Result {
-    bool haveIntonation = false, haveRhythm = false, haveStress = false;
+    bool haveIntonation = false, haveRhythm = false, haveStress = false, havePron = false;
     bool rhythmSpeedOnly = true;    // 단어 정렬이 안 돼 속도만으로 리듬 점수를 냈다
-    float intonation = 0.f, rhythm = 0.f, stress = 0.f;  // 0~100
+    float intonation = 0.f, rhythm = 0.f, stress = 0.f, pron = 0.f;  // 0~100
+    float soundDist = 0.f;          // 발음: 단어별이면 (맞는 단어 거리 / 엉뚱한 단어 거리) 비율, 전체면 평균 코사인 거리 (툴팁용)
+    bool pronByWords = false;       // 발음 점수를 단어별 비교로 냈다 (아니면 문장 전체 DTW — 일본어 · 단어 정렬 실패)
     float speedRatio = 1.f;         // 내 말 길이 / 원음 말 길이 (> 1 이면 내가 느림)
     float pitchDiffSt = 0.f;        // 억양: 시간을 맞춘 뒤 반음 차이의 평균 (툴팁용)
     std::vector<WordPair> words;    // 양쪽 모두에서 찾은 기준 단어들 (기준 문장 순서)
@@ -65,6 +75,9 @@ struct Result {
     std::vector<float> origOnUser;
     bool haveAlignment = false;     // origOnUser 가 유효한가
 };
+
+// 두 클립의 구간(ms) 끼리 소리 거리 (MFCC DTW 평균 거리). 실패하면 -1. 분석 · 실험용
+float soundDistance(const Track& a, int aStartMs, int aEndMs, const Track& b, int bStartMs, int bEndMs);
 
 // 원음(orig) 과 내 녹음(user) 을 비교한다. refText 는 기준 문장. *Words 는 각 클립의 whisper 단어 (비어 있을 수 있다 — 그러면 속도 · DTW 만).
 // 일본어는 whisper 가 단어를 나누지 못하므로 단어 정렬 없이 DTW 와 속도만으로 평가한다.

@@ -277,15 +277,34 @@ void printResult(const prosody::Track& to, const prosody::Track& tu, const proso
                 to.speechEnd, to.medianHz, (int)to.hasDynamics);
     std::printf("user: frames=%d voiced=%d speech=[%d,%d) medianHz=%.1f dynamics=%d\n", tu.frames(), voicedCount(tu), tu.speechStart,
                 tu.speechEnd, tu.medianHz, (int)tu.hasDynamics);
-    std::printf("억양 %s%.1f  리듬 %s%.1f%s  강세 %s%.1f\n", r.haveIntonation ? "" : "(없음) ", r.intonation, r.haveRhythm ? "" : "(없음) ",
-                r.rhythm, r.rhythmSpeedOnly ? " (속도만)" : "", r.haveStress ? "" : "(없음) ", r.stress);
+    std::printf("억양 %s%.1f  리듬 %s%.1f%s  강세 %s%.1f  발음 %s%.1f (거리 %.3f%s)\n", r.haveIntonation ? "" : "(없음) ", r.intonation,
+                r.haveRhythm ? "" : "(없음) ", r.rhythm, r.rhythmSpeedOnly ? " (속도만)" : "", r.haveStress ? "" : "(없음) ", r.stress,
+                r.havePron ? "" : "(없음) ", r.pron, r.soundDist, r.pronByWords ? ", 단어별" : ", 전체");
     std::printf("speedRatio=%.3f pitchDiffSt=%.2f haveAlignment=%d note=\"%s\"\n", r.speedRatio, r.pitchDiffSt, (int)r.haveAlignment,
                 r.note.c_str());
     std::printf("hints: %s\n", hintsStr(r).c_str());
     std::printf("words (%d):\n", (int)r.words.size());
     for (const auto& w : r.words)
-        std::printf("  #%d %-12s orig[%d-%d] user[%d-%d] dur=%.2f loud=%+.2f pitch=%s\n", w.refIdx, w.text.c_str(), w.origStartMs, w.origEndMs,
-                    w.userStartMs, w.userEndMs, w.durRatio, w.loudDiff, w.hasPitch ? f2("%+.1f st", w.pitchDiffSt).c_str() : "-");
+        std::printf("  #%d %-12s orig[%d-%d] user[%d-%d] dur=%.2f loud=%+.2f pitch=%s sound=%s score=%.0f\n", w.refIdx, w.text.c_str(), w.origStartMs, w.origEndMs,
+                    w.userStartMs, w.userEndMs, w.durRatio, w.loudDiff, w.hasPitch ? f2("%+.1f st", w.pitchDiffSt).c_str() : "-",
+                    w.hasSound ? f2("%.2f", w.soundDist).c_str() : "-", w.soundScore);
+    // 실험: 맞는 단어끼리의 거리 vs 엇갈린 단어(원음 i ↔ 내 i±1, i±2)끼리의 거리. 둘이 비슷하면 이 지표는 변별력이 없다
+    {
+        double sm = 0, sx = 0; int nm = 0, nx = 0;
+        for (size_t i = 0; i < r.words.size(); ++i) {
+            const auto& w = r.words[i];
+            if (!w.hasSound) continue;
+            sm += w.soundDist; ++nm;
+            for (int d : {-2, -1, 1, 2}) {
+                const long j = (long)i + d;
+                if (j < 0 || j >= (long)r.words.size()) continue;
+                const auto& v = r.words[(size_t)j];
+                const float dd = prosody::soundDistance(to, w.origStartMs, w.origEndMs, tu, v.userStartMs, v.userEndMs);
+                if (dd >= 0.f) { sx += dd; ++nx; }
+            }
+        }
+        if (nm && nx) std::printf("sound: matched-mean=%.3f mismatched-mean=%.3f ratio=%.3f (n=%d/%d)\n", sm / nm, sx / nx, (sm / nm) / (sx / nx), nm, nx);
+    }
     std::printf("timing: analyze %.1f ms, compare %.1f ms\n", analyzeMs, compareMs);
     plot("orig semitone", to.semitone, nullptr, to.speechStart, to.speechEnd);
     plot("user semitone (#) + orig on user axis (o, @=both)", tu.semitone, r.haveAlignment ? &r.origOnUser : nullptr, tu.speechStart, tu.speechEnd);

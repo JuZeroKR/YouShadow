@@ -80,6 +80,7 @@ struct PracticeHistory {
     std::string recordingPath;
     double score = -1;                              // 단어 정확도 (-1: 없음)
     double intonation = -1, rhythm = -1, stress = -1;  // 억양 · 리듬 · 강세 0~100 (-1: 측정 못 함)
+    double pron = -1;                                   // 발음(소리 유사도) 0~100 (-1: 측정 못 함)
 };
 
 // SQLite 기반 학습 기록. 문장(세그먼트) 단위로 연습 이력, 간격 반복 상태, 북마크를 저장한다.
@@ -99,7 +100,7 @@ public:
     long long addPractice(const PracticeRow& row);   // rowid 반환
     void setPracticeScore(long long id, double score);
     // 억양 · 리듬 · 강세 점수. 음수면 NULL (측정 못 함). score(단어 정확도) 는 그대로 둔다.
-    void setPracticeProsody(long long id, double intonation, double rhythm, double stress);
+    void setPracticeProsody(long long id, double intonation, double rhythm, double stress, double pron = -1);
     std::map<int, int> countsFor(const std::string& videoId) const;
     std::map<int, double> bestScoresFor(const std::string& videoId) const;
     std::string lastRecording(const std::string& videoId, int segIdx) const;

@@ -1529,7 +1529,7 @@ struct App {
                     if (scoreJob.practiceId > 0) {
                         db.setPracticeScore(scoreJob.practiceId, scoreJob.result.accuracy);
                         db.setPracticeProsody(scoreJob.practiceId, p.haveIntonation ? p.intonation : -1,
-                                              p.haveRhythm ? p.rhythm : -1, p.haveStress ? p.stress : -1);
+                                              p.haveRhythm ? p.rhythm : -1, p.haveStress ? p.stress : -1, p.havePron ? p.pron : -1);
                         historyDirty = true;
                     }
                     // 원음 단어 시각을 새로 인식했으면 캐시한다 (그 사이 다른 영상을 열었으면 버린다)
@@ -2134,13 +2134,14 @@ struct App {
             if (percent) ImGui::TextColored(col, "%d%%", (int)std::lround(v));
             else ImGui::TextColored(col, "%d", (int)std::lround(v));
         };
-        if (ImGui::BeginTable("hist", 7, ImGuiTableFlags_RowBg | ImGuiTableFlags_SizingStretchProp)) {
+        if (ImGui::BeginTable("hist", 8, ImGuiTableFlags_RowBg | ImGuiTableFlags_SizingStretchProp)) {
             ImGui::TableSetupColumn("시각", ImGuiTableColumnFlags_WidthStretch, 3.0f);
             ImGui::TableSetupColumn("모드", ImGuiTableColumnFlags_WidthStretch, 1.4f);
             ImGui::TableSetupColumn("정확도", ImGuiTableColumnFlags_WidthStretch, 1.0f);
             ImGui::TableSetupColumn("억양", ImGuiTableColumnFlags_WidthStretch, 0.8f);
             ImGui::TableSetupColumn("리듬", ImGuiTableColumnFlags_WidthStretch, 0.8f);
             ImGui::TableSetupColumn("강세", ImGuiTableColumnFlags_WidthStretch, 0.8f);
+            ImGui::TableSetupColumn("발음", ImGuiTableColumnFlags_WidthStretch, 0.8f);
             ImGui::TableSetupColumn("", ImGuiTableColumnFlags_WidthStretch, 1.2f);
             ImGui::TableHeadersRow();
             for (size_t k = 0; k < history.size(); ++k) {
@@ -2161,6 +2162,8 @@ struct App {
                 scoreCell(h.rhythm, false);
                 ImGui::TableNextColumn();
                 scoreCell(h.stress, false);
+                ImGui::TableNextColumn();
+                scoreCell(h.pron, false);
                 ImGui::TableNextColumn();
                 if (!h.recordingPath.empty() && fs::exists(h.recordingPath)) {
                     if (ImGui::SmallButton("듣기")) {
@@ -2745,8 +2748,9 @@ struct App {
             if (!ja && k < pairOf.size() && pairOf[k]) {
                 const auto& wp = *pairOf[k];
                 if (ImGui::IsItemHovered()) {
-                    if (wp.hasPitch) ImGui::SetTooltip("'%s'  길이 ×%.1f  크기 %+.2f  음높이 %+.1f 반음\n우클릭: 원음 → 내 소리 이어 듣기", wp.text.c_str(), wp.durRatio, wp.loudDiff, wp.pitchDiffSt);
-                    else ImGui::SetTooltip("'%s'  길이 ×%.1f  크기 %+.2f\n우클릭: 원음 → 내 소리 이어 듣기", wp.text.c_str(), wp.durRatio, wp.loudDiff);
+                    const std::string snd = wp.soundScore >= 0.f ? "  소리 " + std::to_string((int)std::lround(wp.soundScore)) + "점" : "";
+                    if (wp.hasPitch) ImGui::SetTooltip("'%s'  길이 ×%.1f  크기 %+.2f  음높이 %+.1f 반음%s\n우클릭: 원음 → 내 소리 이어 듣기", wp.text.c_str(), wp.durRatio, wp.loudDiff, wp.pitchDiffSt, snd.c_str());
+                    else ImGui::SetTooltip("'%s'  길이 ×%.1f  크기 %+.2f%s\n우클릭: 원음 → 내 소리 이어 듣기", wp.text.c_str(), wp.durRatio, wp.loudDiff, snd.c_str());
                 }
                 if (ImGui::IsItemClicked(ImGuiMouseButton_Right)) playWordPair(wp);
             }
@@ -2856,6 +2860,7 @@ struct App {
         if (longEnough && std::fabs(ld) > 0.5f) add(ld < 0 ? "길게" : "짧게");
         if (std::fabs(wp->loudDiff) > 0.2f) add(wp->loudDiff > 0 ? "약하게" : "세게");
         if (wp->hasPitch && std::fabs(wp->pitchDiffSt) > 3.f) add(wp->pitchDiffSt > 0 ? "낮게" : "높게");
+        if (wp->soundScore >= 0.f && wp->soundScore < prosody::kSoundScoreHint) add("소리");
         return m;
     }
 
@@ -3023,6 +3028,15 @@ struct App {
                 ImGui::SameLine(0, 14);
                 ImGui::TextColored(band(p.stress), "강세 %d", (int)std::lround(p.stress));
                 if (ImGui::IsItemHovered()) ImGui::SetTooltip("강세: 단어별 소리 크기 차이");
+            }
+            if (p.havePron) {
+                ImGui::SameLine(0, 14);
+                ImGui::TextColored(band(p.pron), "발음 %d", (int)std::lround(p.pron));
+                if (ImGui::IsItemHovered())
+                    ImGui::SetTooltip("발음: 원음과 실제 낸 소리(스펙트럼 모양) 가 얼마나 비슷한가 — 글자 비교(정확도)와 다릅니다.\n%s\n"
+                                      "단어 아래 '소리' 는 그 단어 소리가 많이 다른 것. 우클릭으로 원음과 이어 들어 보세요",
+                                      p.pronByWords ? ("단어별: 맞는 단어 거리 / 엉뚱한 단어 거리 = " + std::to_string((int)std::lround(p.soundDist * 100)) + "% (낮을수록 좋음)").c_str()
+                                                    : ("문장 전체 비교, 거리 " + std::to_string((int)std::lround(p.soundDist * 100)) + "/100").c_str());
             }
             if (!p.note.empty()) { ImGui::SameLine(0, 14); ImGui::TextDisabled("(%s)", p.note.c_str()); }
         }
@@ -3472,10 +3486,10 @@ struct App {
         else if (cmd == "prosody_dump") {  // 억양 · 리듬 · 강세 결과를 stderr 로 (자동 테스트용)
             const auto& p = lastProsody.result;
             auto sc = [](bool have, float v) { char b[16]; if (!have) return std::string("-"); snprintf(b, sizeof b, "%.0f", v); return std::string(b); };
-            fprintf(stderr, "[prosody] haveScore=%d scoring=%d tracks=%d acc=%.1f intonation=%s rhythm=%s%s stress=%s speed=%.2f pitchDiff=%.2f words=%d align=%d origFrames=%d userFrames=%d note=%s\n",
+            fprintf(stderr, "[prosody] haveScore=%d scoring=%d tracks=%d acc=%.1f intonation=%s rhythm=%s%s stress=%s pron=%s speed=%.2f pitchDiff=%.2f words=%d align=%d origFrames=%d userFrames=%d note=%s\n",
                     (int)haveScore, (int)scoring, (int)lastProsody.have, lastScore.accuracy,
                     sc(p.haveIntonation, p.intonation).c_str(), sc(p.haveRhythm, p.rhythm).c_str(), p.haveRhythm && p.rhythmSpeedOnly ? "(speedOnly)" : "",
-                    sc(p.haveStress, p.stress).c_str(), p.speedRatio, p.pitchDiffSt, (int)p.words.size(), (int)p.haveAlignment,
+                    sc(p.haveStress, p.stress).c_str(), sc(p.havePron, p.pron).c_str(), p.speedRatio, p.pitchDiffSt, (int)p.words.size(), (int)p.haveAlignment,
                     lastProsody.orig.frames(), lastProsody.user.frames(), p.note.c_str());
             for (const auto& hnt : p.hints) fprintf(stderr, "[prosody] hint[%d]: %s\n", hnt.refIdx, hnt.text.c_str());
             for (const auto& wp : p.words)

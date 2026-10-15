@@ -73,7 +73,8 @@ CREATE TABLE IF NOT EXISTS seg_words(
 // 스키마 버전 (PRAGMA user_version). 기존 테이블에 컬럼을 더할 때만 올린다 — 테이블 생성은 IF NOT EXISTS 로 충분하다.
 //  1: videos.lang (학습 언어, 'en' / 'ja')
 //  2: practices.intonation / rhythm / stress (억양 · 리듬 · 강세 점수, NULL 이면 측정 못 함)
-constexpr int kSchemaVersion = 2;
+//  3: practices.pron (발음 · 소리 유사도 점수)
+constexpr int kSchemaVersion = 3;
 
 // 테이블에 컬럼이 없으면 더한다 (이미 있으면 그대로)
 void addColumnIfMissing(sqlite3* db, const std::string& table, const std::string& column, const std::string& decl) {
@@ -149,6 +150,7 @@ bool Db::open(const std::string& path, std::string* err) {
             addColumnIfMissing(db_, "practices", "rhythm", "REAL");
             addColumnIfMissing(db_, "practices", "stress", "REAL");
         }
+        if (ver < 3) addColumnIfMissing(db_, "practices", "pron", "REAL");
         if (ver < kSchemaVersion) exec("PRAGMA user_version=" + std::to_string(kSchemaVersion));
     } catch (const std::exception& e) {
         if (err) *err = e.what();
@@ -203,13 +205,14 @@ void Db::setPracticeScore(long long id, double score) {
     Stmt(db_, "UPDATE practices SET score=? WHERE id=?").bind(1, score).bind(2, id).run();
 }
 
-void Db::setPracticeProsody(long long id, double intonation, double rhythm, double stress) {
+void Db::setPracticeProsody(long long id, double intonation, double rhythm, double stress, double pron) {
     // 바인딩하지 않은 자리는 NULL 로 들어간다
-    Stmt st(db_, "UPDATE practices SET intonation=?, rhythm=?, stress=? WHERE id=?");
+    Stmt st(db_, "UPDATE practices SET intonation=?, rhythm=?, stress=?, pron=? WHERE id=?");
     if (intonation >= 0) st.bind(1, intonation);
     if (rhythm >= 0) st.bind(2, rhythm);
     if (stress >= 0) st.bind(3, stress);
-    st.bind(4, id).run();
+    if (pron >= 0) st.bind(4, pron);
+    st.bind(5, id).run();
 }
 
 std::map<int, int> Db::countsFor(const std::string& videoId) const {
@@ -364,7 +367,7 @@ std::vector<DayStat> Db::dailyStats(int days) const {
 
 std::vector<PracticeHistory> Db::practicesFor(const std::string& videoId, int segIdx) const {
     std::vector<PracticeHistory> out;
-    Stmt st(db_, "SELECT id, mode, at, COALESCE(recording_path, ''), score, intonation, rhythm, stress FROM practices "
+    Stmt st(db_, "SELECT id, mode, at, COALESCE(recording_path, ''), score, intonation, rhythm, stress, pron FROM practices "
                  "WHERE video_id = ? AND seg_idx = ? ORDER BY id DESC");
     st.bind(1, videoId).bind(2, segIdx);
     while (st.step()) {
@@ -377,6 +380,7 @@ std::vector<PracticeHistory> Db::practicesFor(const std::string& videoId, int se
         h.intonation = st.colNull(5) ? -1 : st.colDouble(5);
         h.rhythm = st.colNull(6) ? -1 : st.colDouble(6);
         h.stress = st.colNull(7) ? -1 : st.colDouble(7);
+        h.pron = st.colNull(8) ? -1 : st.colDouble(8);
         out.push_back(h);
     }
     return out;
