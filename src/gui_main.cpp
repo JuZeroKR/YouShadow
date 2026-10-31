@@ -1671,6 +1671,8 @@ struct App {
                 if (nxStart < sp.endMs && nxStart > sp.startMs + 300) sp.endMs = nxStart;
             }
         }
+        // 영상 첫 문장(0 ms 시작)은 첫 단어 100 ms 앞이 음수가 된다. 음수 시각을 size_t 로 바꿔 파형 bin 을 세면 엉뚱한 메모리를 읽어 죽으므로 0 아래로 내려가지 않게
+        sp.startMs = std::max(0, sp.startMs);
         if (sp.endMs - sp.startMs < 300) return Span{s.startMs, s.endMs};
         return sp;
     }
@@ -3331,8 +3333,8 @@ struct App {
         const bool curves = haveScore && scoreSeg == current && !scoring && !quizHidden() && lastProsody.have && valid(current);
         if (valid(current)) {
             const Span s = spanOf(current);  // 자막 큐가 아니라 실제 말 구간 (whisper 로 잡았으면)
-            size_t a = std::min(totalBins, (size_t)s.startMs / kPeakBinMs);
-            size_t b = std::min(totalBins, (size_t)s.endMs / kPeakBinMs);
+            const size_t a = std::min(totalBins, (size_t)std::max(0, s.startMs) / kPeakBinMs);
+            const size_t b = std::max(a, std::min(totalBins, (size_t)std::max(0, s.endMs) / kPeakBinMs));  // b >= a 가 아니면 b - a 가 넘쳐 엉뚱한 메모리를 읽는다
             float ph = (t * 1000 - s.startMs) / (float)(s.endMs - s.startMs);
             const ImVec2 rectPos = ImGui::GetCursorScreenPos();
             drawWaveform(video.peaks.data() + 2 * a, b - a, ImVec2(w, h), IM_COL32(90, 170, 255, 255), mpv.paused() ? -1.0f : ph);
