@@ -778,6 +778,13 @@ struct App {
         requestReadings(idxs);
     }
 
+    // ---- 받아쓰기 (문장 탭 아래 패널에서 쉐도잉하면서) ----
+    int dictSeg = -1;            // 입력칸 · 결과가 속한 문장. 다른 문장으로 가면 비운다
+    char dictBuf[1024] = {};
+    bool dictChecked = false;
+    ScoreResult dictScore;
+    bool dictFocus = false;      // D 키: 다음 프레임에 입력칸으로 커서
+
     // ---- 문장 학습 (리스닝 받아쓰기 / 영작) ----
     int quizKind = 0;            // 0: 리스닝(자막 없이 받아쓰기), 1: 영작(한국어 → 영어)
     int quizSeg = -1;            // 출제 중인 문장 (-1: 없음)
@@ -1260,6 +1267,22 @@ struct App {
         quizRevealed = false;
         quizChecked = false;
         quizBuf[0] = '\0';
+    }
+
+    // 아래 패널 받아쓰기 채점: [학습] 탭 리스닝과 같은 방식 · 같은 기록("listen")
+    void checkDictation() {
+        if (!valid(current) || dictBuf[0] == '\0') return;
+        if (video.lang == Lang::Ja && jaReady) {
+            dictScore = scoreTranscript(jaDict.toReading(seg(current).text, true), jaDict.toReading(dictBuf, true), video.lang);
+            dictScore.heard = dictBuf;
+        } else {
+            dictScore = scoreTranscript(seg(current).text, dictBuf, video.lang);
+        }
+        dictChecked = true;
+        dictSeg = current;
+        long long pid = log(current, "listen");
+        db.setPracticeScore(pid, dictScore.accuracy);
+        refreshStats();
     }
 
     void checkQuiz() {
@@ -3311,6 +3334,30 @@ struct App {
         }
         ImGui::EndDisabled();
 
+        // 2.5행: 받아쓰기 — 자막을 숨기고(H) 듣고 들리는 대로 친 뒤 Enter. 정답과 채점은 이 줄에만 보이고 나머지는 숨긴 그대로
+        if (loaded && valid(current)) {
+            if (dictSeg != current) { dictSeg = current; dictBuf[0] = '\0'; dictChecked = false; }
+            ImGui::TextDisabled("받아쓰기 (D)");
+            ImGui::SameLine();
+            if (dictFocus) { ImGui::SetKeyboardFocusHere(); dictFocus = false; }
+            ImGui::SetNextItemWidth(std::max(240.0f * uiScale, ImGui::GetContentRegionAvail().x * 0.55f));
+            if (ImGui::InputTextWithHint("##dict", "들리는 대로 쓰고 Enter — 채점 뒤 S 로 바로 쉐도잉", dictBuf, sizeof dictBuf, ImGuiInputTextFlags_EnterReturnsTrue) && dictBuf[0] != '\0')
+                checkDictation();
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip("칸에 커서가 있는 동안은 Space · S · R · H 가 글자로 들어갑니다. Enter 를 치거나 칸 밖을 클릭하면 단축키가 다시 살아납니다.");
+            ImGui::SameLine();
+            ImGui::BeginDisabled(dictBuf[0] == '\0');
+            if (ImGui::Button("채점")) checkDictation();
+            ImGui::EndDisabled();
+            if (dictChecked) {
+                ImGui::SameLine();
+                if (ImGui::SmallButton("지우기")) { dictBuf[0] = '\0'; dictChecked = false; }
+                ImGui::TextColored(ImVec4(0.6f, 0.8f, 1.0f, 1.0f), "정답:");
+                ImGui::SameLine();
+                ImGui::TextWrapped("%s", seg(current).text.c_str());
+                drawScoreMarks(dictScore);
+            }
+        }
+
         // 3행: 시크바
         double dur = mpv.duration();
         float t = (float)mpv.timePos();
@@ -3446,6 +3493,7 @@ struct App {
         if (ImGui::IsKeyPressed(ImGuiKey_B, false) && valid(current)) toggleBookmark(current);
         if (ImGui::IsKeyPressed(ImGuiKey_K, false) && !video.ko.empty()) setShowKo(!showKo);
         if (ImGui::IsKeyPressed(ImGuiKey_H, false)) setShowText(!showText);
+        if (ImGui::IsKeyPressed(ImGuiKey_D, false) && valid(current)) dictFocus = true;  // 받아쓰기 칸으로
         if (ImGui::IsKeyPressed(ImGuiKey_P, false) && loaded && video.lang == Lang::Ja) { showPron = !showPron; db.setSetting("ja.showPron", showPron ? "1" : "0"); }
     }
 
@@ -3471,6 +3519,12 @@ struct App {
         else if (cmd == "quiz") startQuiz(std::max(0, current), arg == "compose" ? 1 : 0);
         else if (cmd == "quiz_answer") { std::string rest; std::getline(ss, rest); snprintf(quizBuf, sizeof quizBuf, "%s", (arg + rest).c_str()); checkQuiz(); }
         else if (cmd == "quiz_reveal") quizRevealed = true;
+        else if (cmd == "dict" && valid(current)) {  // dict <text>: 아래 패널 받아쓰기 칸에 쓰고 Enter 한 것처럼
+            std::string rest; std::getline(ss, rest);
+            snprintf(dictBuf, sizeof dictBuf, "%s", (arg + rest).c_str());
+            checkDictation();
+            fprintf(stderr, "[dict] accuracy=%d matched=%d/%d\n", (int)dictScore.accuracy, dictScore.matched, dictScore.total);
+        }
         else if (cmd == "lang") setUiLang(langFromCode(arg));
         else if (cmd == "dict") startDictLoad(!JaDict::installed());  // 일본어 사전 받기/로드
         else if (cmd == "ko") setShowKo(arg != "0");
