@@ -99,6 +99,54 @@ void appendJa(std::string& out, const std::string& w) {
     out += w;
 }
 
+// 조각 끝에 오면 어색한 기능어 (관사 · 전치사 · 접속사 · 대명사 · 조동사). 긴 문장을 길이 때문에 자를 때 이런 단어 뒤에서는 자르지 않는다
+bool isFunctionWord(std::string w) {
+    while (!w.empty() && !std::isalnum((unsigned char)w.back()) && w.back() != '\'') w.pop_back();
+    for (auto& c : w) c = (char)std::tolower((unsigned char)c);
+    static const char* const kWords[] = {
+        "a", "an", "the", "to", "of", "and", "or", "but", "in", "on", "at", "for", "with", "by", "from", "as", "than", "that", "this",
+        "these", "those", "my", "your", "his", "her", "its", "our", "their", "i", "you", "he", "she", "it", "we", "they", "is", "are",
+        "was", "were", "be", "been", "am", "do", "does", "did", "have", "has", "had", "will", "would", "can", "could", "should", "not",
+        "so", "if", "because", "when", "then", "there", "what", "which", "who", "whom", "how", "very", "really", "just", "also",
+        "i'm", "i've", "i'll", "you're", "we're", "they're", "it's", "that's", "there's", "he's", "she's", "don't", "doesn't", "didn't",
+        "can't", "won't", "gonna", "wanna", "into", "about", "like", "some", "every", "any", "no", "much", "more", "most"};
+    for (const char* k : kWords) if (w == k) return true;
+    return false;
+}
+
+// 문장 i 다음에 이 단어가 오면 새 절이 시작되는 것으로 본다 (그 앞에서 자르기 좋다)
+bool startsClause(std::string w) {
+    for (auto& c : w) c = (char)std::tolower((unsigned char)c);
+    static const char* const kWords[] = {"and", "but", "so", "because", "which", "who", "when", "if", "or", "then", "while", "although", "though", "unless", "until", "where"};
+    for (const char* k : kWords) if (w == k) return true;
+    return false;
+}
+
+bool endsClause(const std::string& w) {
+    if (w.empty()) return false;
+    const char c = w.back();
+    return c == ',' || c == ';' || c == ':' || c == '"' || (w.size() >= 2 && w[w.size() - 1] == '-' && w[w.size() - 2] == '-');
+}
+
+// 영어 조각이 길이 한도에 닿았을 때 [begin, i] 안에서 가장 자연스러운 자를 자리. 쉼표 · 접속사 앞 · 긴 쉼을 고르고 기능어 뒤는 피한다.
+size_t bestBreak(const std::vector<Word>& words, size_t begin, size_t i) {
+    const size_t lo = std::max(begin + 4, i >= 20 ? i - 20 : begin + 4);
+    size_t best = i;
+    int bestScore = -1;
+    for (size_t j = lo; j < i; ++j) {
+        if (isFunctionWord(words[j].text)) continue;
+        int score = 0;
+        if (endsClause(words[j].text)) score += 100;
+        if (startsClause(words[j + 1].text)) score += 40;
+        score += std::min(60, std::max(0, words[j + 1].startMs - words[j].endMs) / 10);  // 쉼 100 ms 당 10 점, 최대 60
+        if (score > bestScore || (score == bestScore && score > 0)) { bestScore = score; best = j; }  // 같은 점수면 뒤쪽(긴 조각)을
+    }
+    if (bestScore > 0) return best;
+    // 쉼표도 쉼도 없으면 기능어로 끝나지만 않는 가장 뒤 자리
+    for (size_t j = i; j > lo; --j) if (!isFunctionWord(words[j].text)) return j;
+    return i;
+}
+
 }  // namespace
 
 std::vector<Segment> splitWords(std::vector<Word> words, Lang lang) {
@@ -149,10 +197,12 @@ std::vector<Segment> splitWords(std::vector<Word> words, Lang lang) {
 
     // 분할 규칙: 문장 부호로 끝나거나, 침묵이 길거나, 너무 길어지면 끊는다.
     // 영어는 단어 수, 일본어는 글자 수(자막 덩어리에는 띄어쓰기가 없다) 기준.
+    // 영어는 길이 한도(hardMax)에 닿아도 그 자리에서 자르지 않고 앞쪽의 쉼표 · 접속사 · 쉼 자리에서 자른다 (자동 자막은 문장이 길게 이어진다).
+    // 길어도 자연스러운 쪽을 택하므로 한도는 넉넉하다
     constexpr int kLongGapMs = 800;
     constexpr int kSoftGapMs = 250;
     const int softMax = ja ? 15 : 16;
-    const int hardMax = ja ? 40 : 28;
+    const int hardMax = ja ? 40 : 40;
 
     size_t begin = 0;
     int length = 0;  // 현재 조각의 단어 수(영어) 또는 글자 수(일본어)
@@ -163,8 +213,14 @@ std::vector<Segment> splitWords(std::vector<Word> words, Lang lang) {
         const bool punct = ja ? endsSentenceJa(words[i].text) : endsSentence(words[i].text);
 
         bool cut = last || punct || gap >= kLongGapMs ||
-                   (length >= softMax && gap >= kSoftGapMs) || length >= hardMax;
+                   (length >= softMax && gap >= kSoftGapMs && (ja || !isFunctionWord(words[i].text)));
+        size_t end = i;
+        if (!cut && length >= hardMax) {
+            cut = true;
+            if (!ja) end = bestBreak(words, begin, i);
+        }
         if (!cut) continue;
+        i = end;
 
         Segment s;
         s.startMs = words[begin].startMs;

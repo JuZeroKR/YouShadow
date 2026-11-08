@@ -1,6 +1,7 @@
 // 자막 붙은 단어 떼기(subtitle::splitGlued) 검증용 콘솔 도구. 영어 오프라인 사전이 설치돼 있어야 한다.
 //  subtitle_test                      자체 테스트 (종료 코드 = 실패 수)
 //  subtitle_test <segments.json>      그 파일의 문장 중 바뀌는 것만 "전 → 후" 로 출력 (파일은 고치지 않는다)
+#include <algorithm>
 #include <cstdio>
 #include <string>
 #include <vector>
@@ -17,6 +18,25 @@ int main(int argc, char** argv) {
 #ifdef _WIN32
     SetConsoleOutputCP(CP_UTF8);
 #endif
+    if (argc >= 3 && std::string(argv[1]) == "--split") {
+        // --split <video.en.json3> [all]: 문장 나누기 결과. 문장 부호 없이 끝나는(중간에서 끊긴) 조각 수를 센다
+        auto segs = transcript::parseJson3(argv[2], Lang::En);
+        const bool all = argc >= 4;
+        int noPunct = 0, maxWords = 0;
+        for (const auto& s : segs) {
+            std::string t = s.text;
+            while (!t.empty() && (t.back() == '"' || t.back() == '\'' || t.back() == ')')) t.pop_back();
+            const bool ends = !t.empty() && (t.back() == '.' || t.back() == '?' || t.back() == '!');
+            int words = 1;
+            for (char c : s.text) if (c == ' ') ++words;
+            maxWords = std::max(maxWords, words);
+            if (!ends) ++noPunct;
+            if (all || !ends) std::printf("[%d] (%d단어) %s\n", s.idx, words, s.text.c_str());
+        }
+        std::printf("%zu 문장, 부호 없이 끝남 %d (%.1f%%), 최대 %d 단어\n", segs.size(), noPunct, segs.empty() ? 0.0 : 100.0 * noPunct / segs.size(), maxWords);
+        return 0;
+    }
+
     EnDict dict;
     std::string err;
     if (!dict.load(&err)) { std::printf("영어 사전 로드 실패: %s\n", err.c_str()); return 1; }

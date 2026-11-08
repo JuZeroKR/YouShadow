@@ -20,6 +20,9 @@ struct Word {
 
 namespace transcript {
 
+// 문장 나누기 규칙의 판. 바뀌면 (학습 기록이 없는 영상에 한해) 저장된 segments.json 을 다시 만든다
+constexpr int kSplitVersion = 2;
+
 // 단어 목록을 문장 부호 / 침묵 / 길이 기준으로 문장 세그먼트로 나눈다.
 // 일본어는 글자 수 기준으로 끊고 띄어쓰기 없이 잇는다.
 std::vector<Segment> splitWords(std::vector<Word> words, Lang lang = Lang::En);

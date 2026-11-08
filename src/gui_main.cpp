@@ -66,6 +66,7 @@ struct LoadedVideo {
     std::vector<Segment> segs;
     std::vector<std::string> ko;  // 문장별 한국어 자막 (내 영상 파일에 한국어 자막이 있을 때만, 없으면 비어 있음)
     std::vector<float> peaks;  // 파형용 [min,max] per 10ms
+    bool resplit = false;      // 새 규칙으로 문장을 다시 나눴다 (문장 번호가 바뀌었으니 캐시를 비워야 한다)
 };
 
 struct Loader {
@@ -76,6 +77,7 @@ struct Loader {
     LoadedVideo result;
     Stt* stt = nullptr;
     std::function<bool(const std::string&)> isWord;  // 영어 사전 (붙은 단어 떼기용). 사전이 아직 없으면 비어 있다
+    bool mayResplit = false;  // 학습 기록이 없는 영상이면 문장 나누기 규칙이 바뀌었을 때 다시 나눠도 된다
 
     void setStatus(const std::string& s) {
         std::lock_guard<std::mutex> lock(m);
@@ -97,7 +99,7 @@ struct Loader {
         const std::string lv = localVideo, ls = localSub;
         localVideo.clear();
         localSub.clear();
-        th = std::thread([this, id, lang, isLocal, lv, ls, isWord = isWord] {
+        th = std::thread([this, id, lang, isLocal, lv, ls, isWord = isWord, mayResplit = mayResplit] {
             LoadedVideo v;
             std::string err;
             try {
@@ -124,6 +126,18 @@ struct Loader {
                 const std::string segPath = v.dir + "/segments.json";
                 v.segs = transcript::load(segPath);
                 bool dirty = false;
+                // 문장 나누기 규칙이 바뀌었으면 (유튜브 자막 · 학습 기록 없음) 저장된 문장을 새 규칙으로 다시 만든다. 어느 판으로 나눴는지는 split.ver 에 적어 둔다
+                const std::string verPath = v.dir + "/split.ver";
+                auto readVer = [&] { std::ifstream in(fs::u8path(verPath)); int ver = 1; in >> ver; return in ? ver : 1; };
+                if (!v.segs.empty() && json3 && !subtitlePath.empty() && mayResplit && readVer() < transcript::kSplitVersion) {
+                    auto fresh = transcript::parseJson3(subtitlePath, lang);
+                    if (!fresh.empty()) {
+                        bool same = fresh.size() == v.segs.size();
+                        for (size_t k = 0; same && k < fresh.size(); ++k) same = fresh[k].text == v.segs[k].text;
+                        if (!same) { v.segs = std::move(fresh); v.resplit = true; }
+                        dirty = true;
+                    }
+                }
                 if (v.segs.empty()) {
                     dirty = true;
                     if (!subtitlePath.empty()) {
@@ -149,6 +163,10 @@ struct Loader {
                         v.segs = transcript::splitWords(std::move(words), lang);
                         if (v.segs.empty()) throw std::runtime_error("음성에서 문장을 찾지 못했습니다");
                     }
+                }
+                if (json3 && dirty) {  // 이 판의 규칙으로 나눴다 (처음 나눴거나 다시 나눴거나)
+                    std::ofstream out(fs::u8path(verPath));
+                    out << transcript::kSplitVersion;
                 }
                 // 자막 제작 실수로 붙은 단어("beenafter") 떼기. 사전이 있을 때만, 이미 저장한 문장도 한 번 고쳐 다시 저장한다
                 if (lang == Lang::En && isWord) {
@@ -1730,6 +1748,7 @@ struct App {
                 if (!j.empty()) { JaReading r = JaReading::fromJson(j); if (!r.empty()) readings[i] = r; }
             }
         }
+        if (video.resplit) db.clearSegmentCaches(video.id);  // 문장 번호가 바뀌었으니 해설 · 원음 단어 시각 캐시는 버린다
         db.upsertSegments(video.id, video.segs);
         refreshStats();
         mpv.load(video.videoPath);
@@ -1773,6 +1792,7 @@ struct App {
         // 영어 사전이 준비돼 있으면 붙은 단어를 떼는 데 쓴다 (사전은 시작할 때 한 번 로드되고 그 뒤로는 읽기만 한다)
         if (enReady) loader.isWord = [this](const std::string& w) { return enDict.isKnownWord(w); };
         else loader.isWord = nullptr;
+        loader.mayResplit = !db.hasRecords(id);
         loader.start(id, lang);
     }
 

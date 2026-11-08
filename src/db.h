@@ -102,6 +102,10 @@ public:
     // 억양 · 리듬 · 강세 점수. 음수면 NULL (측정 못 함). score(단어 정확도) 는 그대로 둔다.
     void setPracticeProsody(long long id, double intonation, double rhythm, double stress, double pron = -1);
     std::map<int, int> countsFor(const std::string& videoId) const;
+    // 이 영상에 문장 번호에 묶인 학습 기록(연습 · 복습 상태 · 표현)이 하나라도 있는가. 없으면 문장을 다시 나눠도 잃는 것이 없다
+    bool hasRecords(const std::string& videoId) const;
+    // 문장을 다시 나눴을 때 문장 번호로 찾는 캐시(문장 · 해설 · 읽기 · 원음 단어 시각)를 비운다
+    void clearSegmentCaches(const std::string& videoId);
     std::map<int, double> bestScoresFor(const std::string& videoId) const;
     std::string lastRecording(const std::string& videoId, int segIdx) const;
 

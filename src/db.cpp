@@ -223,6 +223,26 @@ std::map<int, int> Db::countsFor(const std::string& videoId) const {
     return out;
 }
 
+bool Db::hasRecords(const std::string& videoId) const {
+    for (const char* sql : {"SELECT 1 FROM practices WHERE video_id=? LIMIT 1", "SELECT 1 FROM segment_state WHERE video_id=? LIMIT 1",
+                            "SELECT 1 FROM expressions WHERE video_id=? LIMIT 1"}) {
+        Stmt st(db_, sql);
+        st.bind(1, videoId);
+        if (st.step()) return true;
+    }
+    return false;
+}
+
+void Db::clearSegmentCaches(const std::string& videoId) {
+    exec("BEGIN");
+    for (const char* t : {"segments", "explanations", "readings", "seg_words"}) {
+        Stmt st(db_, std::string("DELETE FROM ") + t + " WHERE video_id=?");
+        st.bind(1, videoId);
+        st.run();
+    }
+    exec("COMMIT");
+}
+
 std::map<int, double> Db::bestScoresFor(const std::string& videoId) const {
     std::map<int, double> out;
     Stmt st(db_, "SELECT seg_idx, MAX(score) FROM practices WHERE video_id=? AND score IS NOT NULL GROUP BY seg_idx");
